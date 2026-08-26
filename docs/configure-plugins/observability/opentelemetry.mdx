@@ -52,9 +52,11 @@ Use that pinned snapshot when comparing emitted operation and attribute names
 with collector or backend schemas.
 
 NeMo Relay uses the currently vendored OpenTelemetry Rust SDK (`0.32`). It
-deterministically derives
-compliant trace and span IDs from Relay lifecycle UUIDs, so endpoints that
-receive the same event stream use the same identifiers and parentage. Different
+deterministically derives local span IDs from Relay lifecycle UUIDs. Local
+Relay roots also derive their trace IDs from Relay UUIDs, while a stack created
+with an authenticated remote OTel parent inherits that external trace ID,
+sampling flags, and tracestate. Endpoints that receive the same live event
+stream and scope-stack snapshot use the same identifiers and parentage. Different
 endpoint types must therefore use independent OTLP destinations; configuring
 them with the same endpoint and transport is rejected to prevent identifier
 collisions at the receiver. Duplicate detection compares canonical destinations:
@@ -67,6 +69,14 @@ boundary. Rootless propagation retains Relay event parentage but starts a new
 OpenTelemetry trace from the first local event. Carry W3C `traceparent` and
 `tracestate` alongside Relay propagation when an integration also needs to
 preserve upstream OpenTelemetry sampling or vendor state.
+
+Remote `trace_flags` are explicit, not defaulted by Relay's binding APIs. With
+the default parent-based sampler, a sampled remote parent records local spans
+and an unsampled remote parent does not. Relay still emits its lifecycle
+events, ATOF, ATIF, logs, and metrics according to their own configuration;
+the sampled bit controls trace-span recording. Operators may configure another
+sampler to override upstream policy, but integrations should forward the
+received flags unchanged.
 
 ## `plugins.toml` Example
 

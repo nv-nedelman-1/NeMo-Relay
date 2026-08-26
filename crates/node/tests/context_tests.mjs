@@ -10,6 +10,10 @@ const lib = require('../index.js');
 
 const {
   createScopeStack,
+  createScopeStackWithRemoteParent,
+  createScopeStackFromPropagationWithRemoteParent,
+  captureTraceparent,
+  captureTracestate,
   currentScopeStack,
   setThreadScopeStack,
   scopeStackActive,
@@ -33,6 +37,79 @@ describe('Context isolation', () => {
     const stack = createScopeStack();
     assert.ok(stack, 'Expected a non-null scope stack');
     assert.ok(stack instanceof ScopeStack, 'Expected instance of ScopeStack');
+  });
+
+  it('ordinary scope stacks have no imported tracestate', () => {
+    withScopeStack(createScopeStack(), () => {
+      assert.equal(captureTracestate(), null);
+    });
+  });
+
+  it('creates a stack beneath a remote W3C parent', () => {
+    const stack = createScopeStackWithRemoteParent({
+      traceId: '00112233445566778899aabbccddeeff',
+      parentSpanId: '0123456789abcdef',
+      traceFlags: 0,
+      tracestate: 'vendor=value',
+    });
+    let agent;
+    let traceparent;
+    let tracestate;
+
+    withScopeStack(stack, () => {
+      agent = pushScope('remote-parent-agent', ScopeType.Agent, null, null);
+      traceparent = captureTraceparent();
+      tracestate = captureTracestate();
+      popScope(agent);
+    });
+
+    assert.equal(traceparent, `00-00112233445566778899aabbccddeeff-${agent.uuid.replaceAll('-', '').slice(16)}-00`);
+    assert.equal(tracestate, 'vendor=value');
+  });
+
+  it('rejects invalid remote W3C parent fields', () => {
+    assert.throws(
+      () =>
+        createScopeStackWithRemoteParent({
+          traceId: '01',
+          parentSpanId: '0123456789abcdef',
+          traceFlags: 1,
+        }),
+      /32 hexadecimal/,
+    );
+    for (const traceFlags of [-1, 1.5, 256, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.throws(
+        () =>
+          createScopeStackWithRemoteParent({
+            traceId: '00112233445566778899aabbccddeeff',
+            parentSpanId: '0123456789abcdef',
+            traceFlags,
+          }),
+        /integer from 0 through 255/,
+      );
+    }
+  });
+
+  it('preserves Relay and W3C parentage together', () => {
+    const rootUuid = '018f13f0-7c1a-7a80-8000-000000000001';
+    const parentUuid = '018f13f0-7c1a-7a80-8000-000000000002';
+    const stack = createScopeStackFromPropagationWithRemoteParent(
+      { version: 1, rootUuid, parentUuid },
+      {
+        traceId: '00112233445566778899aabbccddeeff',
+        parentSpanId: '0123456789abcdef',
+        traceFlags: 1,
+        tracestate: 'vendor=value',
+      },
+    );
+
+    withScopeStack(stack, () => {
+      assert.equal(getHandle().uuid, parentUuid);
+      const child = pushScope('combined-child', ScopeType.Agent, null, null);
+      assert.equal(child.parentUuid, parentUuid);
+      assert.match(captureTraceparent(), /^00-00112233445566778899aabbccddeeff-/);
+      popScope(child);
+    });
   });
 
   it('creates an imported stack with the propagated parent on top', () => {

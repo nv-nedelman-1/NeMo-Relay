@@ -31,6 +31,136 @@ def test_create_scope_stack_returns_scope_stack():
     assert repr(stack) == "<ScopeStack>"
 
 
+def test_ordinary_scope_stack_has_no_imported_tracestate():
+    with nemo_relay.use_scope_stack(nemo_relay.create_scope_stack()):
+        assert nemo_relay.capture_tracestate() is None
+
+
+def test_remote_parent_stack_preserves_external_trace_for_onward_capture():
+    stack = nemo_relay.create_scope_stack_with_remote_parent(
+        "00112233445566778899aabbccddeeff",
+        "0123456789abcdef",
+        trace_flags=0,
+        tracestate="vendor=value",
+    )
+
+    with nemo_relay.use_scope_stack(stack):
+        inbound_traceparent = nemo_relay.capture_traceparent()
+        with nemo_relay.scope.scope("agent", nemo_relay.ScopeType.Agent) as agent:
+            traceparent = nemo_relay.capture_traceparent()
+            tracestate = nemo_relay.capture_tracestate()
+
+    assert inbound_traceparent == "00-00112233445566778899aabbccddeeff-0123456789abcdef-00"
+    assert traceparent == (f"00-00112233445566778899aabbccddeeff-{agent.uuid.replace('-', '')[16:]}-00")
+    assert tracestate == "vendor=value"
+
+
+def test_remote_parent_stack_validates_identifiers_and_tracestate():
+    with pytest.raises(ValueError, match="32 hexadecimal"):
+        nemo_relay.create_scope_stack_with_remote_parent(
+            "01",
+            "0123456789abcdef",
+            trace_flags=1,
+        )
+    with pytest.raises(ValueError, match="nonzero trace"):
+        nemo_relay.create_scope_stack_with_remote_parent(
+            "00000000000000000000000000000000",
+            "0123456789abcdef",
+            trace_flags=1,
+        )
+    with pytest.raises(ValueError, match="nonzero trace"):
+        nemo_relay.create_scope_stack_with_remote_parent(
+            "00112233445566778899aabbccddeeff",
+            "0000000000000000",
+            trace_flags=1,
+        )
+    with pytest.raises(ValueError, match="tracestate"):
+        nemo_relay.create_scope_stack_with_remote_parent(
+            "00112233445566778899aabbccddeeff",
+            "0123456789abcdef",
+            trace_flags=1,
+            tracestate="invalid",
+        )
+
+
+def test_combined_relay_and_remote_parent_stack_preserves_both_contexts():
+    root_uuid = str(uuid.uuid4())
+    parent_uuid = str(uuid.uuid4())
+    relay_context = nemo_relay.PropagationContext(parent_uuid, root_uuid)
+    stack = nemo_relay.create_scope_stack_from_propagation_with_remote_parent(
+        relay_context,
+        "00112233445566778899aabbccddeeff",
+        "0123456789abcdef",
+        trace_flags=1,
+        tracestate="vendor=value",
+    )
+
+    with nemo_relay.use_scope_stack(stack):
+        assert nemo_relay.scope.get_handle().uuid == parent_uuid
+        with nemo_relay.scope.scope("child", nemo_relay.ScopeType.Agent) as child:
+            traceparent = nemo_relay.capture_traceparent()
+
+    assert child.parent_uuid == parent_uuid
+    assert traceparent.startswith("00-00112233445566778899aabbccddeeff-")
+
+
+async def test_fork_asyncio_context_preserves_imported_remote_trace():
+    stack = nemo_relay.create_scope_stack_with_remote_parent(
+        "00112233445566778899aabbccddeeff",
+        "0123456789abcdef",
+        trace_flags=1,
+        tracestate="vendor=value",
+    )
+
+    async def child():
+        with nemo_relay.scope.scope("child", nemo_relay.ScopeType.Agent) as handle:
+            return handle, nemo_relay.capture_traceparent(), nemo_relay.capture_tracestate()
+
+    with nemo_relay.use_scope_stack(stack):
+        with nemo_relay.scope.scope("parent", nemo_relay.ScopeType.Agent) as parent:
+            task = asyncio.create_task(child(), context=nemo_relay.fork_asyncio_context())
+            child_handle, traceparent, tracestate = await task
+
+    assert child_handle.parent_uuid == parent.uuid
+    assert traceparent.startswith("00-00112233445566778899aabbccddeeff-")
+    assert tracestate == "vendor=value"
+
+
+async def test_fork_asyncio_context_resyncs_after_another_task_runs():
+    first_ready = asyncio.Event()
+    second_synced = asyncio.Event()
+    release_second = asyncio.Event()
+
+    async def first_task():
+        with nemo_relay.scope.scope("first-parent", nemo_relay.ScopeType.Agent) as parent:
+            first_ready.set()
+            await second_synced.wait()
+
+            async def child():
+                with nemo_relay.scope.scope("first-child", nemo_relay.ScopeType.Function) as handle:
+                    return handle.parent_uuid
+
+            try:
+                child_parent = await asyncio.create_task(
+                    child(),
+                    context=nemo_relay.fork_asyncio_context(),
+                )
+            finally:
+                release_second.set()
+            return parent.uuid, child_parent
+
+    async def second_task():
+        await first_ready.wait()
+        with nemo_relay.scope.scope("second-parent", nemo_relay.ScopeType.Agent):
+            second_synced.set()
+            await release_second.wait()
+
+    first = asyncio.create_task(first_task(), context=contextvars.Context())
+    second = asyncio.create_task(second_task(), context=contextvars.Context())
+    (parent_uuid, child_parent), _ = await asyncio.gather(first, second)
+    assert child_parent == parent_uuid
+
+
 def test_propagation_context_installs_and_restores_a_scoped_stack():
     original = nemo_relay.get_scope_stack()
     root_uuid = str(uuid.uuid4())

@@ -9,11 +9,13 @@ use crate::api::event::{
     METRIC_DATA_SCHEMA_VERSION, MarkEvent, ScopeCategory, ScopeEvent, tool_attributes_to_strings,
 };
 use crate::api::runtime::{
-    NemoRelayContextState, PropagationContext, ThreadScopeStackBinding,
-    capture_propagation_context, capture_thread_scope_stack, create_scope_stack_from_propagation,
-    fork_scope_stack, global_context, restore_thread_scope_stack, set_thread_scope_stack,
+    NemoRelayContextState, PropagationContext, RemoteTraceContext, ThreadScopeStackBinding,
+    capture_propagation_context, capture_thread_scope_stack, create_scope_stack,
+    create_scope_stack_from_propagation, create_scope_stack_with_remote_parent, fork_scope_stack,
+    fork_scope_stack_from_propagation, global_context, restore_thread_scope_stack,
+    set_thread_scope_stack,
 };
-use crate::api::scope::ScopeType;
+use crate::api::scope::{PushScopeParams, ScopeType};
 use crate::api::scope::{event, pop_scope, push_scope};
 use crate::api::tool::ToolAttributes;
 use crate::codec::model_pricing::pricing_test_mutex;
@@ -36,6 +38,7 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::str::FromStr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -654,11 +657,218 @@ fn propagated_root_parent_projects_as_a_remote_otel_parent() {
         ScopeType::Tool,
         None,
     ));
-    let parent_span = parent_context.span();
+    assert!(!parent_context.is_imported_w3c);
+    let parent_span = parent_context.context.span();
     let span_context = parent_span.span_context();
     assert!(span_context.is_remote());
     assert_eq!(span_context.trace_id(), relay_trace_id(root_uuid));
     assert_eq!(span_context.span_id(), relay_span_id(root_uuid));
+}
+
+#[test]
+fn ordinary_fork_from_pinned_context_is_not_labeled_as_imported_w3c() {
+    let parent_uuid = Uuid::now_v7();
+    let _restore_guard = RestoreThreadScopeStackGuard(capture_thread_scope_stack());
+    set_thread_scope_stack(create_scope_stack());
+    let forked = fork_scope_stack_from_propagation(&PropagationContext {
+        version: PropagationContext::VERSION,
+        root_uuid: Some(parent_uuid),
+        parent_uuid,
+    })
+    .unwrap();
+    set_thread_scope_stack(forked);
+
+    let processor = OtelEventProcessor::new(make_provider().0, "test".into());
+    let resolved = processor.parent_context(&make_start_event(
+        Uuid::now_v7(),
+        Some(parent_uuid),
+        "forked-child",
+        ScopeType::Function,
+        None,
+    ));
+
+    assert!(!resolved.is_imported_w3c);
+    assert_eq!(
+        resolved.context.span().span_context().trace_id(),
+        relay_trace_id(parent_uuid)
+    );
+}
+
+#[test]
+fn explicit_w3c_parent_projects_as_remote_parent_without_replacing_relay_ids() {
+    let trace_id = TraceId::from_hex("00112233445566778899aabbccddeeff").unwrap();
+    let parent_span_id = SpanId::from_hex("0123456789abcdef").unwrap();
+    let trace_state = TraceState::from_str("vendor=value").unwrap();
+    let remote_parent = RemoteTraceContext::from_parts(
+        "00112233445566778899aabbccddeeff",
+        "0123456789abcdef",
+        TraceFlags::SAMPLED.to_u8(),
+        Some("vendor=value"),
+    )
+    .unwrap();
+    let stack = create_scope_stack_with_remote_parent(remote_parent);
+    let root_uuid = stack.read().unwrap().root_uuid();
+    let _restore_guard = RestoreThreadScopeStackGuard(capture_thread_scope_stack());
+    set_thread_scope_stack(stack);
+
+    let event_uuid = Uuid::now_v7();
+    let (provider, exporter) = make_provider();
+    let mut processor = OtelEventProcessor::new(provider, "test".into());
+    let start_event = make_start_event(
+        event_uuid,
+        Some(root_uuid),
+        "receiver-agent",
+        ScopeType::Agent,
+        None,
+    );
+    assert!(processor.parent_context(&start_event).is_imported_w3c);
+    processor.process(&start_event);
+    processor.process(&make_end_event(
+        event_uuid,
+        Some(root_uuid),
+        "receiver-agent",
+        ScopeType::Agent,
+        None,
+    ));
+    processor.force_flush().unwrap();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 1);
+    let span = &spans[0];
+    assert_eq!(span.span_context.trace_id(), trace_id);
+    assert_eq!(span.span_context.span_id(), relay_span_id(event_uuid));
+    assert_eq!(span.parent_span_id, parent_span_id);
+    assert!(span.parent_span_is_remote);
+    assert_eq!(span.span_context.trace_flags(), TraceFlags::SAMPLED);
+    assert_eq!(span.span_context.trace_state(), &trace_state);
+}
+
+#[test]
+fn unsampled_w3c_parent_is_not_recorded_by_default_parent_based_sampler() {
+    let remote_parent = RemoteTraceContext::from_parts(
+        "00112233445566778899aabbccddeeff",
+        "0123456789abcdef",
+        TraceFlags::NOT_SAMPLED.to_u8(),
+        None,
+    )
+    .unwrap();
+    let stack = create_scope_stack_with_remote_parent(remote_parent);
+    let root_uuid = stack.read().unwrap().root_uuid();
+    let _restore_guard = RestoreThreadScopeStackGuard(capture_thread_scope_stack());
+    set_thread_scope_stack(stack);
+
+    let event_uuid = Uuid::now_v7();
+    let (provider, exporter) = make_provider();
+    let mut processor = OtelEventProcessor::new(provider, "test".into());
+    processor.process(&make_start_event(
+        event_uuid,
+        Some(root_uuid),
+        "unsampled-agent",
+        ScopeType::Agent,
+        None,
+    ));
+    processor.process(&make_end_event(
+        event_uuid,
+        Some(root_uuid),
+        "unsampled-agent",
+        ScopeType::Agent,
+        None,
+    ));
+    processor.force_flush().unwrap();
+
+    assert!(exporter.get_finished_spans().unwrap().is_empty());
+}
+
+#[test]
+fn forked_remote_stack_projects_current_relay_scope_as_child_parent() {
+    let remote_parent = RemoteTraceContext::from_parts(
+        "00112233445566778899aabbccddeeff",
+        "0123456789abcdef",
+        TraceFlags::SAMPLED.to_u8(),
+        Some("vendor=value"),
+    )
+    .unwrap();
+    let source_stack = create_scope_stack_with_remote_parent(remote_parent);
+    let source_root_uuid = source_stack.read().unwrap().root_uuid();
+    let _restore_guard = RestoreThreadScopeStackGuard(capture_thread_scope_stack());
+    set_thread_scope_stack(source_stack.clone());
+    let parent = push_scope(
+        PushScopeParams::builder()
+            .name("fanout-parent")
+            .scope_type(ScopeType::Agent)
+            .build(),
+    )
+    .unwrap();
+
+    let (provider, exporter) = make_provider();
+    let mut processor = OtelEventProcessor::new(provider, "test".into());
+    processor.process(&make_start_event(
+        parent.uuid,
+        Some(source_root_uuid),
+        "fanout-parent",
+        ScopeType::Agent,
+        None,
+    ));
+
+    let forked = fork_scope_stack().unwrap();
+    set_thread_scope_stack(forked);
+    let child = push_scope(
+        PushScopeParams::builder()
+            .name("fanout-child")
+            .scope_type(ScopeType::Agent)
+            .build(),
+    )
+    .unwrap();
+    processor.process(&make_start_event(
+        child.uuid,
+        Some(parent.uuid),
+        "fanout-child",
+        ScopeType::Agent,
+        None,
+    ));
+    processor.process(&make_end_event(
+        child.uuid,
+        Some(parent.uuid),
+        "fanout-child",
+        ScopeType::Agent,
+        None,
+    ));
+
+    set_thread_scope_stack(source_stack);
+    processor.process(&make_end_event(
+        parent.uuid,
+        Some(source_root_uuid),
+        "fanout-parent",
+        ScopeType::Agent,
+        None,
+    ));
+    processor.force_flush().unwrap();
+
+    let spans = exporter.get_finished_spans().unwrap();
+    let parent_span = spans
+        .iter()
+        .find(|span| span.name == "fanout-parent")
+        .unwrap();
+    let child_span = spans
+        .iter()
+        .find(|span| span.name == "fanout-child")
+        .unwrap();
+    assert_eq!(
+        parent_span.span_context.trace_id(),
+        TraceId::from_hex("00112233445566778899aabbccddeeff").unwrap()
+    );
+    assert_eq!(
+        parent_span.parent_span_id,
+        SpanId::from_hex("0123456789abcdef").unwrap()
+    );
+    assert_eq!(
+        child_span.span_context.trace_id(),
+        parent_span.span_context.trace_id()
+    );
+    assert_eq!(
+        child_span.parent_span_id,
+        parent_span.span_context.span_id()
+    );
 }
 
 #[test]

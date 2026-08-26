@@ -277,9 +277,10 @@ trust remote identifiers automatically.
 
 A rootless context, including the value returned by the default
 `capture_propagation_context()` API, preserves this Relay event parentage but
-does not assert OpenTelemetry trace continuity. The first local span starts a
-new trace. Supply a stable `root_uuid` when the receiver should participate in
-the Relay-derived trace rooted at that UUID.
+does not assert OpenTelemetry trace continuity by itself. When imported without
+a remote W3C parent, the first local span starts a new trace. Supply a stable
+`root_uuid` for a Relay-derived trace or carry `traceparent` alongside the
+Relay context to continue an external trace.
 
 Relay context is distinct from W3C propagation. An integration may carry
 `traceparent` and `tracestate` alongside Relay's JSON context when it needs to
@@ -288,10 +289,16 @@ preserve OpenTelemetry sampling or vendor state.
 For outbound-only W3C propagation, use `capture_traceparent()` to obtain the
 current Relay traceparent directly, or convert a rooted `PropagationContext`
 with `PropagationContext::to_traceparent` (and the equivalent binding methods).
-Rootless contexts cannot be converted because they intentionally start a new
-local OpenTelemetry trace. Managed LLM execution automatically adds one
-runtime-owned `traceparent` header to the provider request; a standalone
-request-intercept call adds it only when a real Relay trace context exists.
+Rootless contexts cannot be converted to traceparent on their own. When
+imported without a remote W3C parent, they intentionally start a new local
+OpenTelemetry trace. Managed LLM execution automatically adds one
+runtime-owned `traceparent` header to the provider request and replaces or
+removes any caller-provided W3C pair. A standalone request-intercept call
+replaces both headers only when a real Relay trace context exists; without one,
+it leaves the caller-provided `traceparent` and `tracestate` pair unchanged.
+Calling `capture_traceparent()` on a bare ordinary stack fails because no local
+span exists. On a bare stack with an adopted remote parent, it returns the
+inbound traceparent unchanged until Relay emits a local scope.
 
 Use the binding's JSON helpers at the transport boundary: Rust
 `PropagationContext::to_json` and `PropagationContext::from_json`, Python
@@ -299,6 +306,119 @@ Use the binding's JSON helpers at the transport boundary: Rust
 `context.ToJSON()` and `PropagationContextFromJSON(...)`, or Node.js
 `propagationContextToJson(...)` and `propagationContextFromJson(...)`. The
 helpers validate the version and UUIDs before a context is imported.
+
+### Adopt an Authenticated Inbound W3C Parent
+
+An application that receives W3C Trace Context from a non-Relay caller can
+create a fresh Relay scope stack beneath that remote OTel parent. Relay does not
+read or trust HTTP, MCP, A2A, or queue headers automatically. The application
+must authenticate the caller, parse the carrier, and pass normalized values:
+
+The component APIs accept hexadecimal IDs case-insensitively and emit lowercase
+canonical traceparents. The application-owned carrier parser remains
+responsible for rejecting a raw traceparent that violates W3C casing or syntax.
+
+```rust
+use nemo_relay::api::runtime::{
+    RemoteTraceContext, create_scope_stack_with_remote_parent, with_scope_stack,
+};
+
+let remote_parent = RemoteTraceContext::from_parts(
+    trace_id,
+    parent_span_id,
+    trace_flags,
+    tracestate,
+)?;
+let stack = create_scope_stack_with_remote_parent(remote_parent);
+
+with_scope_stack(stack, || run_agent())?;
+```
+
+```python
+stack = nemo_relay.create_scope_stack_with_remote_parent(
+    trace_id,
+    parent_span_id,
+    trace_flags=trace_flags,
+    tracestate=tracestate,
+)
+
+with nemo_relay.use_scope_stack(stack):
+    with nemo_relay.scope.scope("agent", nemo_relay.ScopeType.Agent):
+        # Relay scopes retain Relay UUID identity while their OTel spans remain
+        # children of the supplied remote parent.
+        outbound_traceparent = nemo_relay.capture_traceparent()
+        outbound_tracestate = nemo_relay.capture_tracestate()
+```
+
+When both an authenticated Relay propagation payload and W3C headers arrive,
+adopt them together rather than choosing one identity layer:
+
+```rust
+use nemo_relay::api::runtime::{
+    RemoteTraceContext, create_scope_stack_from_propagation_with_remote_parent,
+};
+
+let remote_parent = RemoteTraceContext::from_parts(
+    trace_id,
+    parent_span_id,
+    trace_flags,
+    tracestate,
+)?;
+let stack = create_scope_stack_from_propagation_with_remote_parent(
+    &relay_context,
+    remote_parent,
+)?;
+```
+
+```python
+stack = nemo_relay.create_scope_stack_from_propagation_with_remote_parent(
+    relay_context,
+    trace_id,
+    parent_span_id,
+    trace_flags=trace_flags,
+    tracestate=tracestate,
+)
+```
+
+The equivalent Node.js entry point is
+`createScopeStackFromPropagationWithRemoteParent(...)`. Relay parent UUIDs
+continue to drive lifecycle lineage while the imported W3C context drives
+OTel trace identity, parentage, sampling, and vendor state.
+
+Node.js exposes the same explicit boundary:
+
+```javascript
+const stack = relay.createScopeStackWithRemoteParent({
+  traceId,
+  parentSpanId,
+  traceFlags,
+  tracestate,
+});
+
+await relay.withScopeStack(stack, async () => {
+  // Emit Relay work beneath the authenticated remote parent.
+});
+```
+
+The imported trace ID, parent span ID, flags, and tracestate affect OTel
+parentage only. Relay continues to generate UUIDs for lifecycle events, ATOF,
+and ATIF. Existing `PropagationContext` JSON remains Relay-only and unchanged.
+
+`trace_flags` is required at every binding boundary; integrations must not
+silently assume sampled. With Relay's default parent-based OTel sampling, an
+unsampled remote parent suppresses local span recording while Relay lifecycle
+events and non-OTel outputs continue normally. Configure a different sampler
+only when deliberately overriding upstream sampling policy.
+
+Local stack forks preserve an adopted remote W3C trace. If the fork occurs
+beneath a Relay scope, that current Relay span becomes the remote OTel parent
+of the first event in the child stack. For example,
+`fork_asyncio_context()` retains the imported trace ID, flags, and tracestate
+without mutating the source task's stack.
+
+The remote OTel parent is live scope-stack state captured by registered
+exporters. It is not serialized into ATOF or ATIF, so replaying those artifacts
+alone does not reconstruct the external W3C parent.
 
 ## Practical Guidance
 

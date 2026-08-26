@@ -35,8 +35,8 @@ use super::{
     estimate_cost_for_response_or_requested_model, manual, model_name_for_llm_event,
     promote_event_metadata_attributes, push_serialized_top_level_attributes,
     push_session_identity_attributes, push_tool_result_annotation_attribute,
-    push_top_level_json_attributes, relay_span_id, relay_trace_id, validate_attribute_mappings,
-    validate_metadata_promotion_prefixes,
+    push_top_level_json_attributes, relay_span_id, relay_trace_id, remote_span_context,
+    validate_attribute_mappings, validate_metadata_promotion_prefixes,
 };
 use crate::api::event::{Event, EventNormalizationExt, ScopeCategory};
 use crate::api::runtime::{EventSubscriberFn, current_scope_stack};
@@ -1233,6 +1233,11 @@ pub(super) struct CompletedSpanContext {
     span_context: SpanContext,
 }
 
+struct ResolvedParentContext {
+    context: Context,
+    is_imported_w3c: bool,
+}
+
 impl OtelEventProcessor {
     #[cfg(test)]
     fn new(provider: SdkTracerProvider, instrumentation_scope: String) -> Self {
@@ -1413,7 +1418,10 @@ impl OtelEventProcessor {
 
     fn process_start(&mut self, event: &Event) {
         self.remove_completed_span_context(event.uuid());
-        let parent_context = self.parent_context(event);
+        let ResolvedParentContext {
+            context: parent_context,
+            is_imported_w3c,
+        } = self.parent_context(event);
         let is_trace_root = !parent_context.span().span_context().is_valid();
         let start_model_name = model_name_for_llm_event(event);
         let span_name = match self.otel_type {
@@ -1444,7 +1452,7 @@ impl OtelEventProcessor {
         if self.otel_type == OpenTelemetryType::OpenInference && start_model_name.is_some() {
             super::openinference::remove_start_model_name(&mut attributes);
         }
-        if self.otel_type != OpenTelemetryType::GenAi && is_trace_root {
+        if self.otel_type != OpenTelemetryType::GenAi && (is_trace_root || is_imported_w3c) {
             push_session_identity_attributes(&mut attributes, event);
         }
         // Snapshot keys claimed by the projection so promoted metadata cannot
@@ -1641,12 +1649,13 @@ impl OtelEventProcessor {
             return;
         }
 
+        let parent_context = self.parent_context(event).context;
         let mut span = with_relay_ids(event.uuid(), || {
             self.tracer
                 .span_builder(format!("mark:{mark_name}"))
                 .with_kind(SpanKind::Internal)
                 .with_start_time(timestamp)
-                .start_with_context(&self.tracer, &self.parent_context(event))
+                .start_with_context(&self.tracer, &parent_context)
         });
         if self.otel_type == OpenTelemetryType::OpenInference {
             super::openinference::push_orphan_mark_attributes(&mut attributes);
@@ -1678,12 +1687,13 @@ impl OtelEventProcessor {
         apply_attribute_mappings(&mut attributes, &self.attribute_mappings);
         self.promote_metadata(&mut attributes, event, &HashSet::new());
 
+        let parent_context = self.parent_context(event).context;
         let mut span = with_relay_ids(event.uuid(), || {
             self.tracer
                 .span_builder(format!("mark:{}", event.name()))
                 .with_kind(SpanKind::Internal)
                 .with_start_time(timestamp)
-                .start_with_context(&self.tracer, &self.parent_context(event))
+                .start_with_context(&self.tracer, &parent_context)
         });
         span.set_attributes(attributes);
         span.end_with_timestamp(timestamp);
@@ -1735,32 +1745,54 @@ impl OtelEventProcessor {
         }
     }
 
-    fn parent_context(&self, event: &Event) -> Context {
+    fn parent_context(&self, event: &Event) -> ResolvedParentContext {
         if let Some(active_span) = self.find_parent_span(event) {
-            return Context::new().with_remote_span_context(active_span.span_context.clone());
+            return ResolvedParentContext {
+                context: Context::new().with_remote_span_context(active_span.span_context.clone()),
+                is_imported_w3c: false,
+            };
         }
         if let Some(span_context) = event
             .parent_uuid()
             .and_then(|uuid| self.completed_span_contexts.get(&uuid))
         {
-            return Context::new().with_remote_span_context(span_context.span_context.clone());
+            return ResolvedParentContext {
+                context: Context::new().with_remote_span_context(span_context.span_context.clone()),
+                is_imported_w3c: false,
+            };
         }
         let Some(parent_uuid) = event.parent_uuid() else {
-            return Context::new();
+            return ResolvedParentContext {
+                context: Context::new(),
+                is_imported_w3c: false,
+            };
         };
         let stack = current_scope_stack();
         let stack = stack.read().expect("scope stack lock poisoned");
+        if let Some(remote_parent) = stack.remote_parent_for(parent_uuid) {
+            return ResolvedParentContext {
+                context: Context::new()
+                    .with_remote_span_context(remote_span_context(remote_parent)),
+                is_imported_w3c: true,
+            };
+        }
         if !stack.is_propagated_parent(parent_uuid) {
-            return Context::new();
+            return ResolvedParentContext {
+                context: Context::new(),
+                is_imported_w3c: false,
+            };
         }
         let root_uuid = stack.root_uuid();
-        Context::new().with_remote_span_context(SpanContext::new(
-            relay_trace_id(root_uuid),
-            relay_span_id(parent_uuid),
-            TraceFlags::SAMPLED,
-            true,
-            TraceState::default(),
-        ))
+        ResolvedParentContext {
+            context: Context::new().with_remote_span_context(SpanContext::new(
+                relay_trace_id(root_uuid),
+                relay_span_id(parent_uuid),
+                TraceFlags::SAMPLED,
+                true,
+                TraceState::default(),
+            )),
+            is_imported_w3c: false,
+        }
     }
 
     fn parent_span_uuid(&self, event: &Event) -> Option<Uuid> {

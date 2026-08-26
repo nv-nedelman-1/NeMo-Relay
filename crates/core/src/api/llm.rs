@@ -31,13 +31,15 @@ use crate::api::runtime::{
     LlmSanitizeRequestContext, LlmSanitizeResponseContext, LlmStreamExecutionNextFn,
     MiddlewareContinuationContext, with_active_event_uuid,
 };
-use crate::api::runtime::{ScopeStackHandle, capture_traceparent, current_scope_stack};
+use crate::api::runtime::{
+    ScopeStackHandle, capture_traceparent_if_available, capture_tracestate, current_scope_stack,
+};
 use crate::api::scope::event;
 use crate::api::scope::{EmitMarkEventParams, ScopeHandle, metadata_with_log_severity};
 use crate::api::shared::{
     ensure_runtime_owner, inject_dynamo_session_ids, inject_traceparent, inject_traceparent_value,
-    metadata_with_otel_error, metadata_with_otel_status, resolve_parent_uuid,
-    run_request_intercepts_with_codec_and_recorder, snapshot_event_sanitizers,
+    inject_tracestate_value, metadata_with_otel_error, metadata_with_otel_status,
+    resolve_parent_uuid, run_request_intercepts_with_codec_and_recorder, snapshot_event_sanitizers,
     snapshot_event_subscribers,
 };
 use crate::codec::request::{AnnotatedLlmRequest, Message};
@@ -2052,8 +2054,10 @@ pub async fn llm_request_intercepts(
     )
     .await?;
     inject_dynamo_session_ids(&mut outcome.request);
-    if let Ok(traceparent) = capture_traceparent() {
+    if let Some(traceparent) = capture_traceparent_if_available()? {
+        let tracestate = capture_tracestate()?;
         inject_traceparent_value(&mut outcome.request, traceparent);
+        inject_tracestate_value(&mut outcome.request, tracestate);
     }
     Ok(outcome)
 }

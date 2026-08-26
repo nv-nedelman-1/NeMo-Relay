@@ -6,10 +6,12 @@
 use std::sync::Arc;
 
 use nemo_relay::api::runtime::{
-    PropagationContext, ScopeStack, TASK_SCOPE_STACK, capture_traceparent, create_scope_stack,
-    create_scope_stack_from_propagation, current_scope_stack, fork_scope_stack,
-    propagate_scope_to_thread, scope_stack_active, set_thread_scope_stack, sync_thread_scope_stack,
-    task_scope_push, task_scope_remove, task_scope_top, with_scope_stack,
+    PropagationContext, RemoteTraceContext, ScopeStack, TASK_SCOPE_STACK, capture_traceparent,
+    capture_tracestate, create_scope_stack, create_scope_stack_from_propagation,
+    create_scope_stack_from_propagation_with_remote_parent, create_scope_stack_with_remote_parent,
+    current_scope_stack, fork_scope_stack, propagate_scope_to_thread, scope_stack_active,
+    set_thread_scope_stack, sync_thread_scope_stack, task_scope_push, task_scope_remove,
+    task_scope_top, with_scope_stack,
 };
 use nemo_relay::api::scope::{
     PopScopeParams, PushScopeParams, ScopeHandle, ScopeType, pop_scope, push_scope,
@@ -172,6 +174,175 @@ fn test_rooted_propagation_context_formats_traceparent() {
 fn test_capture_traceparent_requires_an_emitted_scope() {
     set_thread_scope_stack(create_scope_stack());
     assert!(capture_traceparent().is_err());
+}
+
+#[test]
+fn test_remote_trace_context_preserves_trace_identity_for_onward_capture() {
+    let remote = RemoteTraceContext::from_parts(
+        "00112233445566778899aabbccddeeff",
+        "0123456789abcdef",
+        0,
+        Some("vendor=value"),
+    )
+    .unwrap();
+    let stack = create_scope_stack_with_remote_parent(remote);
+    set_thread_scope_stack(stack);
+    assert_eq!(
+        capture_traceparent().unwrap(),
+        "00-00112233445566778899aabbccddeeff-0123456789abcdef-00"
+    );
+
+    let agent = push_scope(
+        PushScopeParams::builder()
+            .name("agent")
+            .scope_type(ScopeType::Agent)
+            .build(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        capture_traceparent().unwrap(),
+        format!(
+            "00-00112233445566778899aabbccddeeff-{}-00",
+            &agent.uuid.to_string().replace('-', "")[16..]
+        )
+    );
+    assert_eq!(
+        capture_tracestate().unwrap().as_deref(),
+        Some("vendor=value")
+    );
+}
+
+#[test]
+fn test_ordinary_scope_stack_has_no_imported_tracestate() {
+    set_thread_scope_stack(create_scope_stack());
+    assert_eq!(capture_tracestate().unwrap(), None);
+}
+
+#[test]
+fn test_fork_scope_stack_preserves_remote_trace_and_uses_current_relay_parent() {
+    let remote = RemoteTraceContext::from_parts(
+        "00112233445566778899aabbccddeeff",
+        "0123456789abcdef",
+        1,
+        Some("vendor=value"),
+    )
+    .unwrap();
+    set_thread_scope_stack(create_scope_stack_with_remote_parent(remote));
+    let parent = push_scope(
+        PushScopeParams::builder()
+            .name("parent")
+            .scope_type(ScopeType::Agent)
+            .build(),
+    )
+    .unwrap();
+
+    set_thread_scope_stack(fork_scope_stack().unwrap());
+    let child = push_scope(
+        PushScopeParams::builder()
+            .name("child")
+            .scope_type(ScopeType::Agent)
+            .build(),
+    )
+    .unwrap();
+
+    assert_eq!(child.parent_uuid, Some(parent.uuid));
+    assert_eq!(
+        capture_traceparent().unwrap(),
+        format!(
+            "00-00112233445566778899aabbccddeeff-{}-01",
+            &child.uuid.to_string().replace('-', "")[16..]
+        )
+    );
+    assert_eq!(
+        capture_tracestate().unwrap().as_deref(),
+        Some("vendor=value")
+    );
+}
+
+#[test]
+fn test_combined_relay_and_w3c_propagation_preserves_both_lineages() {
+    let root_uuid = Uuid::now_v7();
+    let parent_uuid = Uuid::now_v7();
+    let relay_context = PropagationContext {
+        version: PropagationContext::VERSION,
+        root_uuid: Some(root_uuid),
+        parent_uuid,
+    };
+    let remote = RemoteTraceContext::from_parts(
+        "00112233445566778899aabbccddeeff",
+        "0123456789abcdef",
+        1,
+        None,
+    )
+    .unwrap();
+    let stack =
+        create_scope_stack_from_propagation_with_remote_parent(&relay_context, remote).unwrap();
+    set_thread_scope_stack(stack);
+    assert_eq!(task_scope_top().uuid, parent_uuid);
+
+    let child = push_scope(
+        PushScopeParams::builder()
+            .name("child")
+            .scope_type(ScopeType::Agent)
+            .build(),
+    )
+    .unwrap();
+    assert_eq!(child.parent_uuid, Some(parent_uuid));
+    assert!(
+        capture_traceparent()
+            .unwrap()
+            .starts_with("00-00112233445566778899aabbccddeeff-")
+    );
+}
+
+#[test]
+fn test_remote_trace_context_rejects_invalid_identifiers_and_tracestate() {
+    assert!(RemoteTraceContext::from_parts("01", "0123456789abcdef", 1, None).is_err());
+    assert!(
+        RemoteTraceContext::from_parts(
+            "00000000000000000000000000000000",
+            "0123456789abcdef",
+            1,
+            None,
+        )
+        .is_err()
+    );
+    assert!(
+        RemoteTraceContext::from_parts(
+            "00112233445566778899aabbccddeeff",
+            "0000000000000000",
+            1,
+            None,
+        )
+        .is_err()
+    );
+    assert!(
+        RemoteTraceContext::from_parts(
+            "00112233445566778899aabbccddeeff",
+            "0123456789abcdef",
+            1,
+            Some("invalid"),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn test_remote_trace_context_canonicalizes_parsed_hexadecimal_ids() {
+    let remote = RemoteTraceContext::from_parts(
+        "00112233445566778899AABBCCDDEEFF",
+        "0123456789ABCDEF",
+        1,
+        None,
+    )
+    .unwrap();
+    set_thread_scope_stack(create_scope_stack_with_remote_parent(remote));
+
+    assert_eq!(
+        capture_traceparent().unwrap(),
+        "00-00112233445566778899aabbccddeeff-0123456789abcdef-01"
+    );
 }
 
 #[test]

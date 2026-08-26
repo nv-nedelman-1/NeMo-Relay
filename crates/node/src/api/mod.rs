@@ -40,11 +40,16 @@ use nemo_relay::api::runtime::{
     ToolExecutionNextFn,
 };
 use nemo_relay::api::runtime::{
-    TASK_SCOPE_STACK, capture_propagation_context as capture_propagation_context_handle,
+    RemoteTraceContext, TASK_SCOPE_STACK,
+    capture_propagation_context as capture_propagation_context_handle,
     capture_propagation_context_with_root as capture_propagation_context_with_root_handle,
     capture_traceparent as capture_traceparent_handle,
+    capture_traceparent_for_parent as capture_traceparent_for_parent_handle,
+    capture_tracestate as capture_tracestate_handle,
     create_scope_stack as create_scope_stack_handle,
     create_scope_stack_from_propagation as create_scope_stack_from_propagation_handle,
+    create_scope_stack_from_propagation_with_remote_parent as create_scope_stack_from_propagation_with_remote_parent_handle,
+    create_scope_stack_with_remote_parent as create_scope_stack_with_remote_parent_handle,
     current_scope_stack as current_scope_stack_handle, scope_stack_active as scope_stack_is_active,
     set_thread_scope_stack as bind_thread_scope_stack, task_scope_top,
     with_scope_stack as with_scope_stack_handle,
@@ -2118,6 +2123,15 @@ pub struct PropagationContext {
     pub parent_uuid: String,
 }
 
+/// Validated W3C parent fields for a fresh Relay scope stack.
+#[napi(object)]
+pub struct RemoteTraceContextInput {
+    pub trace_id: String,
+    pub parent_span_id: String,
+    pub trace_flags: f64,
+    pub tracestate: Option<String>,
+}
+
 fn propagation_context_from_napi(
     context: PropagationContext,
 ) -> napi::Result<nemo_relay::api::runtime::PropagationContext> {
@@ -2152,6 +2166,26 @@ fn propagation_context_to_napi(
     }
 }
 
+fn remote_trace_context_from_napi(
+    context: RemoteTraceContextInput,
+) -> napi::Result<RemoteTraceContext> {
+    if !context.trace_flags.is_finite()
+        || context.trace_flags.fract() != 0.0
+        || !(0.0..=f64::from(u8::MAX)).contains(&context.trace_flags)
+    {
+        return Err(napi::Error::from_reason(
+            "remote trace flags must be an integer from 0 through 255",
+        ));
+    }
+    RemoteTraceContext::from_parts(
+        &context.trace_id,
+        &context.parent_span_id,
+        context.trace_flags as u8,
+        context.tracestate.as_deref(),
+    )
+    .map_err(|error| napi::Error::from_reason(error.to_string()))
+}
+
 /// Creates a new isolated scope stack.
 #[napi]
 pub fn create_scope_stack() -> ScopeStack {
@@ -2159,6 +2193,34 @@ pub fn create_scope_stack() -> ScopeStack {
         inner: create_scope_stack_handle(),
         publication_buffer: None,
     }
+}
+
+/// Create a fresh isolated scope stack beneath a validated remote OTel parent.
+#[napi]
+pub fn create_scope_stack_with_remote_parent(
+    context: RemoteTraceContextInput,
+) -> napi::Result<ScopeStack> {
+    let parent = remote_trace_context_from_napi(context)?;
+    Ok(ScopeStack {
+        inner: create_scope_stack_with_remote_parent_handle(parent),
+        publication_buffer: None,
+    })
+}
+
+/// Create a stack preserving both Relay and remote OTel parentage.
+#[napi]
+pub fn create_scope_stack_from_propagation_with_remote_parent(
+    context: PropagationContext,
+    remote_parent: RemoteTraceContextInput,
+) -> napi::Result<ScopeStack> {
+    let context = propagation_context_from_napi(context)?;
+    let remote_parent = remote_trace_context_from_napi(remote_parent)?;
+    create_scope_stack_from_propagation_with_remote_parent_handle(&context, remote_parent)
+        .map(|inner| ScopeStack {
+            inner,
+            publication_buffer: None,
+        })
+        .map_err(|error| napi::Error::from_reason(error.to_string()))
 }
 
 /// Capture the current Relay causal parent for application-managed transport.
@@ -2215,24 +2277,21 @@ pub fn capture_traceparent(env: Env) -> napi::Result<String> {
     if let Some(parent_uuid) = callback_factory::callback_propagation_parent_uuid(&env)? {
         let parent_uuid = uuid::Uuid::parse_str(&parent_uuid)
             .map_err(|error| napi::Error::from_reason(format!("invalid parent UUID: {error}")))?;
-        let root_uuid = with_effective_scope_stack(&env, capture_traceparent_handle)
-            .ok()
-            .and_then(|result| result.ok())
-            .and_then(|traceparent| {
-                traceparent
-                    .get(3..35)
-                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
-            })
-            .unwrap_or(parent_uuid);
-        return nemo_relay::api::runtime::PropagationContext {
-            version: nemo_relay::api::runtime::PropagationContext::VERSION,
-            root_uuid: Some(root_uuid),
-            parent_uuid,
-        }
-        .to_traceparent()
+        return with_effective_scope_stack(&env, || {
+            capture_traceparent_for_parent_handle(parent_uuid)
+        })
+        .map_err(|error| napi::Error::from_reason(error.to_string()))?
         .map_err(|error| napi::Error::from_reason(error.to_string()));
     }
     with_effective_scope_stack(&env, capture_traceparent_handle)
+        .map_err(|error| napi::Error::from_reason(error.to_string()))?
+        .map_err(|error| napi::Error::from_reason(error.to_string()))
+}
+
+/// Capture imported W3C tracestate from the current Relay scope stack.
+#[napi]
+pub fn capture_tracestate(env: Env) -> napi::Result<Option<String>> {
+    with_effective_scope_stack(&env, capture_tracestate_handle)
         .map_err(|error| napi::Error::from_reason(error.to_string()))?
         .map_err(|error| napi::Error::from_reason(error.to_string()))
 }

@@ -40,12 +40,35 @@ ancestry and shared scope-local middleware.
   `contextvars`, or explicitly propagate when work leaves the current execution
   context
 - **Rust core**: use runtime helpers such as `create_scope_stack()`,
-  `current_scope_stack()`, and `set_thread_scope_stack(...)` when an integration
-  needs explicit stack ownership
+  `current_scope_stack()`, `fork_scope_stack()`, and
+  `set_thread_scope_stack(...)` when an integration needs explicit stack
+  ownership
 - **Go**: use `NewScopeStack()` and `ScopeStack.Run(...)` for goroutine-safe
   usage
 - **Node.js**: create and set a scope stack explicitly for the current execution
   path with `createScopeStack()` and `setThreadScopeStack(...)`
+
+## Cross-Boundary Context
+
+Relay UUID lineage and W3C Trace Context are separate identity layers. Carry
+both when a receiver must preserve Relay lifecycle ancestry and an external
+OTel trace:
+
+- Rust uses `create_scope_stack_from_propagation(...)` for Relay-only context,
+  `create_scope_stack_with_remote_parent(...)` for W3C-only context, and
+  `create_scope_stack_from_propagation_with_remote_parent(...)` for both.
+- Python exposes the equivalent snake-case constructors. Use
+  `fork_asyncio_context()` when creating concurrent child tasks.
+- Node.js exposes `createScopeStackFromPropagation(...)`,
+  `createScopeStackWithRemoteParent(...)`, and
+  `createScopeStackFromPropagationWithRemoteParent(...)`.
+
+Authenticate the caller and parse inbound `traceparent` and `tracestate` at the
+application transport boundary before creating a stack. Relay does not trust
+or import HTTP, MCP, A2A, queue, or other carrier headers automatically.
+`trace_flags` is required so an unsampled upstream decision is not silently
+changed. Local stack forks retain an adopted remote trace while giving each
+branch an isolated mutable stack.
 
 ## Common Failures
 
@@ -55,6 +78,8 @@ ancestry and shared scope-local middleware.
 - Integrations activate NeMo Relay without an explicitly initialized stack
 - Relying on a thread-local stack after crossing async tasks, goroutines, or JS
   worker boundaries
+- Importing untrusted W3C headers directly or carrying only one of Relay
+  propagation and W3C context when both identity layers are required
 
 ## Related Skills
 

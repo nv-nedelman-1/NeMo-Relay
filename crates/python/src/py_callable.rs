@@ -35,7 +35,8 @@ use nemo_relay::api::runtime::{
     LlmSanitizeRequestFn, LlmSanitizeResponseContext, LlmSanitizeResponseFn,
     LlmStreamExecutionNextFn, LlmStreamInner, MiddlewareContinuationContext, ScopeStackHandle,
     ToolConditionalFn, ToolExecutionNextFn, ToolInterceptFn, ToolSanitizeFn,
-    capture_propagation_context, capture_traceparent, current_scope_stack,
+    capture_propagation_context, capture_relay_root_uuid, capture_traceparent_for_parent,
+    capture_tracestate, current_scope_stack,
 };
 use nemo_relay::error::{FlowError, Result as FlowResult};
 use pyo3::exceptions::PyRuntimeError;
@@ -507,27 +508,29 @@ fn copy_middleware_invocation<'py>(
             (None, None)
         };
     if let Some(context) = invocation_context.as_ref() {
-        let parent_var = py
-            .import("nemo_relay")
-            .and_then(|module| module.getattr("_propagation_parent_var"));
+        let module = py.import("nemo_relay")?;
+        let parent_var = module.getattr("_propagation_parent_var");
         if let Ok(parent_var) = parent_var {
             let propagation_context = capture_propagation_context()
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-            let propagation_parent_uuid = propagation_context.parent_uuid.to_string();
+            let parent_uuid = propagation_context.parent_uuid;
+            let propagation_parent_uuid = parent_uuid.to_string();
             context.call_method1("run", (parent_var.getattr("set")?, propagation_parent_uuid))?;
-            let root_var = py
-                .import("nemo_relay")
-                .and_then(|module| module.getattr("_propagation_root_var"))?;
+            let root_var = module.getattr("_propagation_root_var")?;
             let root_uuid = context.call_method1("run", (root_var.getattr("get")?,))?;
             if root_uuid.is_none()
-                && let Ok(traceparent) = capture_traceparent()
+                && let Ok(propagation_root_uuid) = capture_relay_root_uuid()
             {
-                let propagation_root_uuid = traceparent
-                    .get(3..35)
-                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
-                    .ok_or_else(|| PyRuntimeError::new_err("invalid Relay traceparent"))?
-                    .to_string();
+                let propagation_root_uuid = propagation_root_uuid.to_string();
                 context.call_method1("run", (root_var.getattr("set")?, propagation_root_uuid))?;
+            }
+            if let Ok(traceparent) = capture_traceparent_for_parent(parent_uuid) {
+                let traceparent_var = module.getattr("_propagation_traceparent_var")?;
+                context.call_method1("run", (traceparent_var.getattr("set")?, traceparent))?;
+            }
+            if let Ok(tracestate) = capture_tracestate() {
+                let tracestate_var = module.getattr("_propagation_tracestate_var")?;
+                context.call_method1("run", (tracestate_var.getattr("set")?, tracestate))?;
             }
         }
     }
