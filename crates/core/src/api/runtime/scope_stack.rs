@@ -22,6 +22,10 @@ use crate::context::registries::ScopeLocalRegistries;
 use crate::error::{FlowError, Result};
 use crate::registry::{RegistryEntry, SortedRegistry};
 
+pub(crate) fn relay_span_id_u64(uuid: Uuid) -> u64 {
+    uuid.as_u128() as u64
+}
+
 /// Mutable stack of active scopes plus their scope-local registries.
 ///
 /// The stack always contains an implicit root agent scope. It owns freshness
@@ -35,6 +39,107 @@ pub struct ScopeStack {
     fresh_agents: HashSet<Uuid>,
     propagated_parent_uuid: Option<Uuid>,
     propagated_root_uuid: Option<Uuid>,
+    remote_otel_parent: Option<AdoptedRemoteParent>,
+}
+
+#[derive(Debug, Clone)]
+struct AdoptedRemoteParent {
+    relay_parent_uuid: Uuid,
+    context: RemoteTraceContext,
+}
+
+/// An application-validated remote OpenTelemetry parent for a fresh Relay scope stack.
+///
+/// This context is deliberately separate from [`PropagationContext`]: Relay UUIDs
+/// remain the lifecycle identity, while these W3C values affect only OpenTelemetry
+/// trace parentage and onward W3C propagation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteTraceContext {
+    trace_id: u128,
+    parent_span_id: u64,
+    trace_flags: u8,
+    tracestate: Option<String>,
+}
+
+impl RemoteTraceContext {
+    /// Parse normalized hexadecimal IDs and optional W3C tracestate.
+    pub fn from_parts(
+        trace_id: &str,
+        parent_span_id: &str,
+        trace_flags: u8,
+        tracestate: Option<&str>,
+    ) -> Result<Self> {
+        if trace_id.len() != 32 || !trace_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(FlowError::InvalidArgument(
+                "remote trace ID must contain exactly 32 hexadecimal characters".into(),
+            ));
+        }
+        if parent_span_id.len() != 16
+            || !parent_span_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(FlowError::InvalidArgument(
+                "remote parent span ID must contain exactly 16 hexadecimal characters".into(),
+            ));
+        }
+
+        let trace_id = u128::from_str_radix(trace_id, 16).map_err(|error| {
+            FlowError::InvalidArgument(format!("invalid remote trace ID: {error}"))
+        })?;
+        let parent_span_id = u64::from_str_radix(parent_span_id, 16).map_err(|error| {
+            FlowError::InvalidArgument(format!("invalid remote parent span ID: {error}"))
+        })?;
+        if trace_id == 0 || parent_span_id == 0 {
+            return Err(FlowError::InvalidArgument(
+                "remote trace context requires nonzero trace and parent span IDs".into(),
+            ));
+        }
+        let tracestate = tracestate
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                crate::observability::validate_tracestate(value)?;
+                Ok(value.to_string())
+            })
+            .transpose()?;
+
+        Ok(Self {
+            trace_id,
+            parent_span_id,
+            trace_flags,
+            tracestate,
+        })
+    }
+
+    pub(crate) fn trace_id(&self) -> u128 {
+        self.trace_id
+    }
+
+    pub(crate) fn parent_span_id(&self) -> u64 {
+        self.parent_span_id
+    }
+
+    pub(crate) fn trace_flags(&self) -> u8 {
+        self.trace_flags
+    }
+
+    pub(crate) fn tracestate(&self) -> Option<&str> {
+        self.tracestate.as_deref()
+    }
+
+    fn with_parent_span_id(&self, parent_span_id: u64) -> Self {
+        Self {
+            trace_id: self.trace_id,
+            parent_span_id,
+            trace_flags: self.trace_flags,
+            tracestate: self.tracestate.clone(),
+        }
+    }
+
+    fn format_traceparent(&self, parent_span_id: u64) -> String {
+        format!(
+            "00-{:032x}-{parent_span_id:016x}-{:02x}",
+            self.trace_id, self.trace_flags
+        )
+    }
 }
 
 /// Versioned, transport-neutral causal context for crossing a Relay boundary.
@@ -43,14 +148,15 @@ pub struct ScopeStack {
 /// and trusting this value. It intentionally contains only Relay identifiers;
 /// OpenTelemetry `traceparent` and `tracestate` remain transport sidecars. A
 /// context without a `root_uuid` preserves Relay event parentage when imported.
-/// The first local OpenTelemetry span created after import starts a new trace.
+/// When imported without an accompanying [`RemoteTraceContext`], the first
+/// local OpenTelemetry span starts a new trace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PropagationContext {
     /// Wire-format version. Version 1 is the only currently supported value.
     pub version: u16,
     /// Stable session root when the sending application knows one. When this
-    /// root is omitted, the first local OpenTelemetry span after import starts
-    /// a new trace.
+    /// root is omitted and no [`RemoteTraceContext`] is supplied alongside this
+    /// context, the first local OpenTelemetry span starts a new trace.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root_uuid: Option<Uuid>,
     /// Immediate Relay event or scope that caused the boundary crossing.
@@ -122,6 +228,7 @@ impl ScopeStack {
             fresh_agents: self.fresh_agents.clone(),
             propagated_parent_uuid: self.propagated_parent_uuid,
             propagated_root_uuid: self.propagated_root_uuid,
+            remote_otel_parent: self.remote_otel_parent.clone(),
         }
     }
 
@@ -142,7 +249,17 @@ impl ScopeStack {
             fresh_agents: HashSet::from([root_uuid]),
             propagated_parent_uuid: None,
             propagated_root_uuid: None,
+            remote_otel_parent: None,
         }
+    }
+
+    fn with_remote_parent(parent: RemoteTraceContext) -> Self {
+        let mut stack = Self::new();
+        stack.remote_otel_parent = Some(AdoptedRemoteParent {
+            relay_parent_uuid: stack.root_uuid(),
+            context: parent,
+        });
+        stack
     }
 
     fn from_propagation(context: &PropagationContext) -> Result<Self> {
@@ -184,7 +301,20 @@ impl ScopeStack {
             fresh_agents: HashSet::from([root_uuid]),
             propagated_parent_uuid: context.root_uuid.map(|_| context.parent_uuid),
             propagated_root_uuid: context.root_uuid,
+            remote_otel_parent: None,
         })
+    }
+
+    fn from_propagation_with_remote_parent(
+        context: &PropagationContext,
+        remote_parent: RemoteTraceContext,
+    ) -> Result<Self> {
+        let mut stack = Self::from_propagation(context)?;
+        stack.remote_otel_parent = Some(AdoptedRemoteParent {
+            relay_parent_uuid: context.parent_uuid,
+            context: remote_parent,
+        });
+        Ok(stack)
     }
 
     /// Push a scope handle onto the top of the stack.
@@ -236,6 +366,30 @@ impl ScopeStack {
     /// Whether `uuid` is the synthetic parent imported from propagation.
     pub fn is_propagated_parent(&self, uuid: Uuid) -> bool {
         self.propagated_parent_uuid == Some(uuid)
+    }
+
+    /// Return the adopted remote OTel parent when `uuid` is this stack's
+    /// imported W3C boundary anchor.
+    pub(crate) fn remote_parent_for(&self, uuid: Uuid) -> Option<&RemoteTraceContext> {
+        self.remote_otel_parent
+            .as_ref()
+            .filter(|parent| parent.relay_parent_uuid == uuid)
+            .map(|parent| &parent.context)
+    }
+
+    fn remote_parent(&self) -> Option<&RemoteTraceContext> {
+        self.remote_otel_parent
+            .as_ref()
+            .map(|parent| &parent.context)
+    }
+
+    fn remote_child_context_for(&self, parent_uuid: Uuid) -> Option<RemoteTraceContext> {
+        let remote_parent = self.remote_otel_parent.as_ref()?;
+        if remote_parent.relay_parent_uuid == parent_uuid {
+            return Some(remote_parent.context.clone());
+        }
+        let parent_span_id = relay_span_id_u64(parent_uuid);
+        Some(remote_parent.context.with_parent_span_id(parent_span_id))
     }
 
     /// Return the full ordered stack of scope handles.
@@ -452,6 +606,14 @@ pub fn create_scope_stack() -> ScopeStackHandle {
     Arc::new(RwLock::new(ScopeStack::new()))
 }
 
+/// Create a fresh isolated scope stack beneath a validated remote OTel parent.
+///
+/// Relay still generates the implicit root and all emitted lifecycle UUIDs.
+/// The supplied context affects only OTel parentage and onward W3C propagation.
+pub fn create_scope_stack_with_remote_parent(parent: RemoteTraceContext) -> ScopeStackHandle {
+    Arc::new(RwLock::new(ScopeStack::with_remote_parent(parent)))
+}
+
 /// Clone a scope stack into an isolated emission-time snapshot.
 #[doc(hidden)]
 pub(crate) fn snapshot_scope_stack(handle: &ScopeStackHandle) -> Result<ScopeStackHandle> {
@@ -474,13 +636,24 @@ pub fn create_scope_stack_from_propagation(
     )?)))
 }
 
+/// Create an isolated stack that preserves both Relay causal lineage and an
+/// application-validated remote OTel parent.
+pub fn create_scope_stack_from_propagation_with_remote_parent(
+    context: &PropagationContext,
+    remote_parent: RemoteTraceContext,
+) -> Result<ScopeStackHandle> {
+    Ok(Arc::new(RwLock::new(
+        ScopeStack::from_propagation_with_remote_parent(context, remote_parent)?,
+    )))
+}
+
 /// Create an isolated scope stack below the current causal parent.
 ///
 /// Capture the parent before spawning concurrent work, then install the
 /// returned stack with `TASK_SCOPE_STACK.scope(...)`. The fork preserves event
-/// parentage but does not transfer scope-local registrations. Because the fork
-/// does not assert a root UUID, its first local OpenTelemetry span starts a new
-/// trace.
+/// parentage but does not transfer scope-local registrations. An ordinary fork
+/// starts a new local OpenTelemetry trace; a stack with an adopted remote W3C
+/// parent preserves that external trace.
 ///
 /// # Examples
 ///
@@ -497,15 +670,29 @@ pub fn create_scope_stack_from_propagation(
 /// ```
 pub fn fork_scope_stack() -> Result<ScopeStackHandle> {
     let context = capture_propagation_context()?;
-    create_scope_stack_from_propagation(&context)
+    fork_scope_stack_from_propagation(&context)
+}
+
+/// Fork from an already captured Relay parent while preserving a genuine
+/// adopted W3C parent when the current stack has one.
+#[doc(hidden)]
+pub fn fork_scope_stack_from_propagation(context: &PropagationContext) -> Result<ScopeStackHandle> {
+    context.validate()?;
+    match capture_remote_trace_context_for_parent(context.parent_uuid)? {
+        Some(remote_parent) => {
+            create_scope_stack_from_propagation_with_remote_parent(context, remote_parent)
+        }
+        None => create_scope_stack_from_propagation(context),
+    }
 }
 
 /// Capture the current causal parent without asserting a session root.
 ///
-/// Importing the returned context preserves Relay event parentage but starts a
-/// new local OpenTelemetry trace. Use [`capture_propagation_context_with_root`]
-/// when the receiver should participate in a Relay-derived trace rooted at a
-/// stable application UUID.
+/// Importing the returned context by itself preserves Relay event parentage but
+/// starts a new local OpenTelemetry trace. Use
+/// [`capture_propagation_context_with_root`] for a Relay-derived trace rooted at
+/// a stable application UUID, or import a [`RemoteTraceContext`] alongside it
+/// to continue an external W3C trace.
 pub fn capture_propagation_context() -> Result<PropagationContext> {
     capture_propagation_context_with_root(None)
 }
@@ -526,29 +713,85 @@ pub fn capture_propagation_context_with_root(
 }
 
 /// Capture the current rooted Relay context as a W3C `traceparent` value.
+///
+/// A bare ordinary stack has no emitted local span and returns an error. A bare
+/// stack created with an adopted remote parent returns that inbound parent
+/// unchanged until Relay emits a local scope.
 pub fn capture_traceparent() -> Result<String> {
+    capture_traceparent_if_available()?.ok_or_else(|| {
+        FlowError::InvalidArgument(
+            "no emitted Relay scope is available for traceparent capture".into(),
+        )
+    })
+}
+
+pub(crate) fn capture_traceparent_if_available() -> Result<Option<String>> {
     let active_uuid = active_event_uuid();
     let parent_uuid = active_uuid.unwrap_or_else(|| task_scope_top().uuid);
     let stack = current_scope_stack();
     let stack_guard = stack
         .read()
         .map_err(|error| FlowError::Internal(error.to_string()))?;
+    if stack_guard.remote_parent().is_some() {
+        return Ok(Some(traceparent_for_parent_in_stack(
+            &stack_guard,
+            parent_uuid,
+            parent_uuid,
+        )));
+    }
     let root_uuid = stack_guard
+        .propagated_root_uuid
+        .or_else(|| stack_guard.scopes().get(1).map(|scope| scope.uuid))
+        .or(active_uuid);
+    Ok(root_uuid
+        .map(|root_uuid| traceparent_for_parent_in_stack(&stack_guard, parent_uuid, root_uuid)))
+}
+
+/// Capture the imported W3C tracestate associated with the current scope stack.
+pub fn capture_tracestate() -> Result<Option<String>> {
+    let stack = current_scope_stack();
+    let stack_guard = stack
+        .read()
+        .map_err(|error| FlowError::Internal(error.to_string()))?;
+    Ok(stack_guard
+        .remote_parent()
+        .and_then(RemoteTraceContext::tracestate)
+        .map(str::to_string))
+}
+
+fn capture_remote_trace_context_for_parent(
+    parent_uuid: Uuid,
+) -> Result<Option<RemoteTraceContext>> {
+    let stack = current_scope_stack();
+    let stack_guard = stack
+        .read()
+        .map_err(|error| FlowError::Internal(error.to_string()))?;
+    Ok(stack_guard.remote_child_context_for(parent_uuid))
+}
+
+/// Capture the current Relay trace root UUID without interpreting OTel trace
+/// identity as Relay lifecycle identity.
+#[doc(hidden)]
+pub fn capture_relay_root_uuid() -> Result<Uuid> {
+    let active_uuid = active_event_uuid();
+    let stack = current_scope_stack();
+    let stack_guard = stack
+        .read()
+        .map_err(|error| FlowError::Internal(error.to_string()))?;
+    stack_guard
         .propagated_root_uuid
         .or_else(|| stack_guard.scopes().get(1).map(|scope| scope.uuid))
         .or(active_uuid)
         .ok_or_else(|| {
             FlowError::InvalidArgument(
-                "no emitted Relay scope is available for traceparent capture".into(),
+                "no emitted Relay scope is available for root capture".into(),
             )
-        })?;
-    Ok(crate::observability::format_traceparent(
-        root_uuid,
-        parent_uuid,
-    ))
+        })
 }
 
-pub(crate) fn traceparent_for_llm(parent_uuid: Uuid) -> Result<String> {
+/// Format a traceparent for a specific Relay event in the current stack.
+#[doc(hidden)]
+pub fn capture_traceparent_for_parent(parent_uuid: Uuid) -> Result<String> {
     let stack = current_scope_stack();
     let stack_guard = stack
         .read()
@@ -557,10 +800,29 @@ pub(crate) fn traceparent_for_llm(parent_uuid: Uuid) -> Result<String> {
         .propagated_root_uuid
         .or_else(|| stack_guard.scopes().get(1).map(|scope| scope.uuid))
         .unwrap_or(parent_uuid);
-    Ok(crate::observability::format_traceparent(
-        root_uuid,
+    Ok(traceparent_for_parent_in_stack(
+        &stack_guard,
         parent_uuid,
+        root_uuid,
     ))
+}
+
+fn traceparent_for_parent_in_stack(
+    stack: &ScopeStack,
+    parent_uuid: Uuid,
+    root_uuid: Uuid,
+) -> String {
+    if let Some(remote_parent) = stack.remote_parent_for(parent_uuid) {
+        return remote_parent.format_traceparent(remote_parent.parent_span_id());
+    }
+    if let Some(remote_parent) = stack.remote_parent() {
+        return remote_parent.format_traceparent(relay_span_id_u64(parent_uuid));
+    }
+    crate::observability::format_traceparent(root_uuid, parent_uuid)
+}
+
+pub(crate) fn traceparent_for_llm(parent_uuid: Uuid) -> Result<String> {
+    capture_traceparent_for_parent(parent_uuid)
 }
 
 tokio::task_local! {

@@ -4,8 +4,11 @@
 //! Optional observability integrations for NeMo Relay Core.
 
 use crate::api::event::{EventNormalizationExt, is_valid_event_metadata_attribute_key};
+use crate::api::runtime::{RemoteTraceContext, relay_span_id_u64};
 use crate::codec::response::{AnnotatedLlmResponse, ApiSpecificResponse, Usage};
+use crate::error::{FlowError, Result};
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 /// Copies a projected OTLP attribute to a second attribute name.
 ///
@@ -151,24 +154,41 @@ pub(crate) fn relay_trace_id(uuid: uuid::Uuid) -> opentelemetry::trace::TraceId 
 }
 
 pub(crate) fn relay_span_id(uuid: uuid::Uuid) -> opentelemetry::trace::SpanId {
-    let mut bytes = [0; 8];
-    bytes.copy_from_slice(&uuid.as_bytes()[8..]);
-    opentelemetry::trace::SpanId::from_bytes(bytes)
+    opentelemetry::trace::SpanId::from_bytes(relay_span_id_u64(uuid).to_be_bytes())
+}
+
+pub(crate) fn validate_tracestate(value: &str) -> Result<()> {
+    opentelemetry::trace::TraceState::from_str(value)
+        .map(|_| ())
+        .map_err(|error| FlowError::InvalidArgument(format!("invalid remote tracestate: {error}")))
+}
+
+pub(crate) fn remote_span_context(
+    context: &RemoteTraceContext,
+) -> opentelemetry::trace::SpanContext {
+    let trace_state = context
+        .tracestate()
+        .map(|value| {
+            opentelemetry::trace::TraceState::from_str(value)
+                .expect("RemoteTraceContext tracestate is validated at construction")
+        })
+        .unwrap_or_default();
+    opentelemetry::trace::SpanContext::new(
+        opentelemetry::trace::TraceId::from_bytes(context.trace_id().to_be_bytes()),
+        opentelemetry::trace::SpanId::from_bytes(context.parent_span_id().to_be_bytes()),
+        opentelemetry::trace::TraceFlags::new(context.trace_flags()),
+        true,
+        trace_state,
+    )
 }
 
 /// Format a W3C traceparent from Relay's deterministic trace and span IDs.
 pub(crate) fn format_traceparent(trace_uuid: uuid::Uuid, span_uuid: uuid::Uuid) -> String {
-    let trace_id = trace_uuid
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let span_id = &span_uuid.as_bytes()[8..];
-    let span_id = span_id
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("00-{trace_id}-{span_id}-01")
+    format!(
+        "00-{}-{}-01",
+        relay_trace_id(trace_uuid),
+        relay_span_id(span_uuid),
+    )
 }
 
 pub(crate) fn push_common_optimization_attributes(

@@ -133,6 +133,10 @@ from nemo_relay._native import (
     ToolExecutionInterceptOutcome,
     ToolExecutionResult,
     ToolHandle,
+    _capture_relay_root_uuid,
+    _capture_traceparent_for_parent,
+    _fork_scope_stack,
+    _fork_scope_stack_from_propagation,
     _shutdown_default_logging,
 )
 from nemo_relay._native import (
@@ -143,9 +147,16 @@ from nemo_relay._native import (
 )
 from nemo_relay._native import capture_thread_scope_stack as _capture_thread_scope_stack
 from nemo_relay._native import capture_traceparent as _capture_traceparent
+from nemo_relay._native import capture_tracestate as _capture_tracestate
 from nemo_relay._native import create_scope_stack as _create_scope_stack
 from nemo_relay._native import (
     create_scope_stack_from_propagation as _create_scope_stack_from_propagation,
+)
+from nemo_relay._native import (
+    create_scope_stack_from_propagation_with_remote_parent as _create_scope_stack_from_propagation_with_remote_parent,
+)
+from nemo_relay._native import (
+    create_scope_stack_with_remote_parent as _create_scope_stack_with_remote_parent,
 )
 from nemo_relay._native import restore_thread_scope_stack as _restore_thread_scope_stack
 from nemo_relay._native import scope_stack_active as _native_scope_stack_active
@@ -292,6 +303,15 @@ _propagation_parent_var: contextvars.ContextVar[str | None] = contextvars.Contex
 _propagation_root_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "propagation_root",
     default=None,
+)
+_PROPAGATION_W3C_UNPINNED = object()
+_propagation_traceparent_var: contextvars.ContextVar[str | object] = contextvars.ContextVar(
+    "propagation_traceparent",
+    default=_PROPAGATION_W3C_UNPINNED,
+)
+_propagation_tracestate_var: contextvars.ContextVar[str | None | object] = contextvars.ContextVar(
+    "propagation_tracestate",
+    default=_PROPAGATION_W3C_UNPINNED,
 )
 
 
@@ -463,6 +483,75 @@ def create_scope_stack() -> ScopeStack:
     return _create_scope_stack()
 
 
+def create_scope_stack_with_remote_parent(
+    trace_id: str,
+    parent_span_id: str,
+    *,
+    trace_flags: int,
+    tracestate: str | None = None,
+) -> ScopeStack:
+    """Create a fresh Relay stack beneath a validated remote OTel parent.
+
+    Args:
+        trace_id: Exactly 32 hexadecimal characters identifying the upstream
+            W3C trace.
+        parent_span_id: Exactly 16 hexadecimal characters identifying the
+            upstream remote parent span.
+        trace_flags: W3C trace flags as an unsigned byte. Relay honors the
+            upstream sampled bit through its configured OTel sampler.
+        tracestate: Optional validated W3C tracestate header value.
+
+    Returns:
+        ScopeStack: A fresh, uninstalled stack whose first local Relay scope is
+        exported beneath the supplied remote parent.
+
+    Raises:
+        ValueError: If an identifier or tracestate value is invalid.
+
+    Behavior:
+        This function does not read or trust transport headers automatically.
+        The application must authenticate the caller and pass validated values.
+
+    The external trace context affects OTel parentage and onward W3C
+    propagation only. Relay still owns all local lifecycle UUIDs.
+    """
+    return _create_scope_stack_with_remote_parent(
+        trace_id,
+        parent_span_id,
+        trace_flags,
+        tracestate,
+    )
+
+
+def create_scope_stack_from_propagation_with_remote_parent(
+    context: PropagationContext,
+    trace_id: str,
+    parent_span_id: str,
+    *,
+    trace_flags: int,
+    tracestate: str | None = None,
+) -> ScopeStack:
+    """Create a stack preserving Relay and W3C parentage across a boundary.
+
+    Args:
+        context: Authenticated Relay propagation context.
+        trace_id: Exactly 32 hexadecimal W3C trace-ID characters.
+        parent_span_id: Exactly 16 hexadecimal remote parent span-ID characters.
+        trace_flags: Required W3C trace flags as an unsigned byte.
+        tracestate: Optional W3C tracestate.
+
+    Returns:
+        ScopeStack: A fresh, uninstalled stack preserving both identity layers.
+    """
+    return _create_scope_stack_from_propagation_with_remote_parent(
+        context,
+        trace_id,
+        parent_span_id,
+        trace_flags,
+        tracestate,
+    )
+
+
 def capture_propagation_context() -> PropagationContext:
     """Capture the current Relay causal parent for application-managed transport.
 
@@ -498,12 +587,35 @@ def capture_traceparent() -> str:
 
     Returns:
         str: Encoded W3C traceparent value for the current Relay context.
+
+    Raises:
+        RuntimeError: If an ordinary stack has not emitted a local scope.
+
+    A bare stack with an adopted remote parent returns the inbound traceparent
+    unchanged until Relay emits a local scope.
     """
     get_scope_stack()
+    traceparent = _propagation_traceparent_var.get()
+    if isinstance(traceparent, str):
+        return traceparent
     parent_uuid = _propagation_parent_var.get()
     if parent_uuid:
-        return PropagationContext(parent_uuid, _propagation_root_var.get() or parent_uuid).to_traceparent()
+        return _capture_traceparent_for_parent(parent_uuid)
     return _capture_traceparent()
+
+
+def capture_tracestate() -> str | None:
+    """Capture imported W3C tracestate from the current scope stack.
+
+    Returns:
+        str | None: The preserved tracestate value, or ``None`` when the stack
+        has no imported remote OTel parent.
+    """
+    get_scope_stack()
+    tracestate = _propagation_tracestate_var.get()
+    if tracestate is None or isinstance(tracestate, str):
+        return tracestate
+    return _capture_tracestate()
 
 
 def create_scope_stack_from_propagation(context: PropagationContext) -> ScopeStack:
@@ -557,10 +669,17 @@ def fork_asyncio_context() -> contextvars.Context:
                 )
                 await task
     """
-    propagation = capture_propagation_context()
-    stack = create_scope_stack_from_propagation(propagation)
+    if _propagation_parent_var.get():
+        stack = _fork_scope_stack_from_propagation(capture_propagation_context())
+    else:
+        get_scope_stack()
+        stack = _fork_scope_stack()
     child_context = contextvars.copy_context()
     child_context.run(_scope_stack_var.set, stack)
+    child_context.run(_propagation_parent_var.set, None)
+    child_context.run(_propagation_root_var.set, None)
+    child_context.run(_propagation_traceparent_var.set, _PROPAGATION_W3C_UNPINNED)
+    child_context.run(_propagation_tracestate_var.set, _PROPAGATION_W3C_UNPINNED)
     return child_context
 
 
@@ -585,13 +704,17 @@ def use_scope_stack(stack: ScopeStack) -> Iterator[ScopeStack]:
     token = _scope_stack_var.set(stack)
     _sync_thread_scope_stack(stack)
     try:
-        root_uuid = _capture_traceparent().split("-")[1]
+        root_uuid = _capture_relay_root_uuid()
     except RuntimeError:
         root_uuid = None
     root_token = _propagation_root_var.set(root_uuid)
+    traceparent_token = _propagation_traceparent_var.set(_PROPAGATION_W3C_UNPINNED)
+    tracestate_token = _propagation_tracestate_var.set(_PROPAGATION_W3C_UNPINNED)
     try:
         yield stack
     finally:
+        _propagation_tracestate_var.reset(tracestate_token)
+        _propagation_traceparent_var.reset(traceparent_token)
         _propagation_root_var.reset(root_token)
         _scope_stack_var.reset(token)
         _restore_thread_scope_stack(previous_native_stack)
@@ -669,9 +792,12 @@ __all__ = [
     "ScopeStack",
     "PropagationContext",
     "create_scope_stack",
+    "create_scope_stack_with_remote_parent",
+    "create_scope_stack_from_propagation_with_remote_parent",
     "capture_propagation_context",
     "capture_propagation_context_with_root",
     "capture_traceparent",
+    "capture_tracestate",
     "create_scope_stack_from_propagation",
     "fork_asyncio_context",
     "get_scope_stack",

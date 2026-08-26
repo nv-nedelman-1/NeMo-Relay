@@ -25,13 +25,20 @@ use nemo_relay::api::runtime::{
     LlmExecutionNextFn, LlmJsonStream, LlmStreamExecutionNextFn, ToolExecutionNextFn,
 };
 use nemo_relay::api::runtime::{
-    TASK_SCOPE_STACK, capture_propagation_context as capture_propagation_context_handle,
+    RemoteTraceContext, TASK_SCOPE_STACK,
+    capture_propagation_context as capture_propagation_context_handle,
     capture_propagation_context_with_root as capture_propagation_context_with_root_handle,
+    capture_relay_root_uuid as capture_relay_root_uuid_handle,
     capture_thread_scope_stack as capture_thread_scope_stack_handle,
     capture_traceparent as capture_traceparent_handle,
+    capture_traceparent_for_parent as capture_traceparent_for_parent_handle,
+    capture_tracestate as capture_tracestate_handle,
     create_scope_stack as create_scope_stack_handle,
     create_scope_stack_from_propagation as create_scope_stack_from_propagation_handle,
-    current_scope_stack as current_scope_stack_handle,
+    create_scope_stack_from_propagation_with_remote_parent as create_scope_stack_from_propagation_with_remote_parent_handle,
+    create_scope_stack_with_remote_parent as create_scope_stack_with_remote_parent_handle,
+    current_scope_stack as current_scope_stack_handle, fork_scope_stack as fork_scope_stack_handle,
+    fork_scope_stack_from_propagation as fork_scope_stack_from_propagation_handle,
     restore_thread_scope_stack as restore_thread_scope_stack_handle,
     scope_stack_active as scope_stack_is_active, set_thread_scope_stack as bind_thread_scope_stack,
     sync_thread_scope_stack as sync_bound_thread_scope_stack, task_scope_top,
@@ -450,6 +457,65 @@ pub fn create_scope_stack() -> PyScopeStack {
     }
 }
 
+/// Create a fresh isolated scope stack beneath a validated remote OTel parent.
+#[pyfunction]
+#[pyo3(signature = (trace_id, parent_span_id, trace_flags, tracestate=None))]
+pub fn create_scope_stack_with_remote_parent(
+    trace_id: &str,
+    parent_span_id: &str,
+    trace_flags: u8,
+    tracestate: Option<&str>,
+) -> PyResult<PyScopeStack> {
+    let parent = RemoteTraceContext::from_parts(trace_id, parent_span_id, trace_flags, tracestate)
+        .map_err(|error| PyErr::new::<pyo3::exceptions::PyValueError, _>(error.to_string()))?;
+    Ok(PyScopeStack {
+        inner: create_scope_stack_with_remote_parent_handle(parent),
+        publication_buffer: None,
+    })
+}
+
+/// Create a stack preserving both Relay propagation and a remote OTel parent.
+#[pyfunction]
+#[pyo3(signature = (context, trace_id, parent_span_id, trace_flags, tracestate=None))]
+pub fn create_scope_stack_from_propagation_with_remote_parent(
+    context: &PyPropagationContext,
+    trace_id: &str,
+    parent_span_id: &str,
+    trace_flags: u8,
+    tracestate: Option<&str>,
+) -> PyResult<PyScopeStack> {
+    let parent = RemoteTraceContext::from_parts(trace_id, parent_span_id, trace_flags, tracestate)
+        .map_err(|error| PyErr::new::<pyo3::exceptions::PyValueError, _>(error.to_string()))?;
+    create_scope_stack_from_propagation_with_remote_parent_handle(&context.inner, parent)
+        .map(|inner| PyScopeStack {
+            inner,
+            publication_buffer: None,
+        })
+        .map_err(to_py_err)
+}
+
+/// Fork the current Relay stack while preserving any adopted W3C trace.
+#[pyfunction(name = "_fork_scope_stack")]
+pub fn fork_scope_stack() -> PyResult<PyScopeStack> {
+    fork_scope_stack_handle()
+        .map(|inner| PyScopeStack {
+            inner,
+            publication_buffer: None,
+        })
+        .map_err(to_py_err)
+}
+
+/// Fork from a Python-pinned Relay parent without inventing W3C context.
+#[pyfunction(name = "_fork_scope_stack_from_propagation")]
+pub fn fork_scope_stack_from_propagation(context: &PyPropagationContext) -> PyResult<PyScopeStack> {
+    fork_scope_stack_from_propagation_handle(&context.inner)
+        .map(|inner| PyScopeStack {
+            inner,
+            publication_buffer: None,
+        })
+        .map_err(to_py_err)
+}
+
 /// Capture a transport-neutral context from the current Relay scope stack.
 #[pyfunction]
 pub fn capture_propagation_context() -> PyResult<PyPropagationContext> {
@@ -476,6 +542,27 @@ pub fn capture_propagation_context_with_root(
 #[pyfunction]
 pub fn capture_traceparent() -> PyResult<String> {
     capture_traceparent_handle().map_err(to_py_err)
+}
+
+/// Capture the imported W3C tracestate for the current scope stack.
+#[pyfunction]
+pub fn capture_tracestate() -> PyResult<Option<String>> {
+    capture_tracestate_handle().map_err(to_py_err)
+}
+
+/// Return Relay's current lifecycle root UUID without conflating it with the
+/// active OTel trace ID.
+#[pyfunction(name = "_capture_relay_root_uuid")]
+pub fn capture_relay_root_uuid() -> PyResult<String> {
+    capture_relay_root_uuid_handle()
+        .map(|uuid| uuid.to_string())
+        .map_err(to_py_err)
+}
+
+/// Capture a traceparent for a specific Relay parent UUID.
+#[pyfunction(name = "_capture_traceparent_for_parent")]
+pub fn capture_traceparent_for_parent(parent_uuid: &str) -> PyResult<String> {
+    capture_traceparent_for_parent_handle(parse_uuid(parent_uuid)?).map_err(to_py_err)
 }
 
 /// Create an isolated scope stack seeded from a received propagation context.
@@ -2295,9 +2382,19 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Scope stack creation / binding / query
     m.add_function(wrap_pyfunction!(create_scope_stack, m)?)?;
+    m.add_function(wrap_pyfunction!(create_scope_stack_with_remote_parent, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        create_scope_stack_from_propagation_with_remote_parent,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(fork_scope_stack, m)?)?;
+    m.add_function(wrap_pyfunction!(fork_scope_stack_from_propagation, m)?)?;
     m.add_function(wrap_pyfunction!(capture_propagation_context, m)?)?;
     m.add_function(wrap_pyfunction!(capture_propagation_context_with_root, m)?)?;
     m.add_function(wrap_pyfunction!(capture_traceparent, m)?)?;
+    m.add_function(wrap_pyfunction!(capture_tracestate, m)?)?;
+    m.add_function(wrap_pyfunction!(capture_relay_root_uuid, m)?)?;
+    m.add_function(wrap_pyfunction!(capture_traceparent_for_parent, m)?)?;
     m.add_function(wrap_pyfunction!(create_scope_stack_from_propagation, m)?)?;
     m.add_function(wrap_pyfunction!(set_thread_scope_stack, m)?)?;
     m.add_function(wrap_pyfunction!(capture_thread_scope_stack, m)?)?;

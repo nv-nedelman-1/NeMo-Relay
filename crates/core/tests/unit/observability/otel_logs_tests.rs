@@ -8,7 +8,12 @@ use crate::api::event::{
     BaseEvent, CategoryProfile, DataSchema, EventCategory, METRIC_DATA_SCHEMA_NAME,
     METRIC_DATA_SCHEMA_VERSION, MarkEvent, ScopeCategory, ScopeEvent,
 };
+use crate::api::runtime::{
+    RemoteTraceContext, capture_thread_scope_stack, create_scope_stack_with_remote_parent,
+    restore_thread_scope_stack, set_thread_scope_stack,
+};
 use crate::api::scope::ScopeType;
+use opentelemetry::trace::TraceId;
 use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLoggerProvider};
 use serde_json::json;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -105,6 +110,37 @@ fn scope_lineage_retains_active_contexts_and_preserves_root_trace_id() {
     lineage.process_end(&scope(child, ScopeCategory::End));
     assert!(!lineage.active.contains_key(&child));
     assert!(lineage.completed.contains_key(&child));
+}
+
+#[test]
+fn scope_lineage_inherits_explicit_remote_parent_identity() {
+    let trace_id = TraceId::from_hex("00112233445566778899aabbccddeeff").unwrap();
+    let remote_parent = RemoteTraceContext::from_parts(
+        "00112233445566778899aabbccddeeff",
+        "0123456789abcdef",
+        TraceFlags::NOT_SAMPLED.to_u8(),
+        Some("vendor=value"),
+    )
+    .unwrap();
+    let stack = create_scope_stack_with_remote_parent(remote_parent);
+    let root_uuid = stack.read().unwrap().root_uuid();
+    let previous = capture_thread_scope_stack();
+    set_thread_scope_stack(stack);
+
+    let mut lineage = ScopeLineage::new();
+    let child = Uuid::now_v7();
+    lineage.process_start(&scope_with_parent(
+        child,
+        Some(root_uuid),
+        ScopeCategory::Start,
+    ));
+    let child_context = &lineage.active[&child];
+
+    assert_eq!(child_context.trace_id(), trace_id);
+    assert_eq!(child_context.span_id(), relay_span_id(child));
+    assert_eq!(child_context.trace_flags(), TraceFlags::NOT_SAMPLED);
+
+    restore_thread_scope_stack(previous);
 }
 
 #[test]

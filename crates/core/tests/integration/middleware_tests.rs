@@ -61,8 +61,9 @@ use nemo_relay::api::registry::{
 use nemo_relay::api::runtime::NemoRelayContextState;
 use nemo_relay::api::runtime::global_context;
 use nemo_relay::api::runtime::{
-    LlmExecutionNextFn, LlmJsonStream, LlmStreamExecutionNextFn, LlmStreamInner, TASK_SCOPE_STACK,
-    ToolExecutionNextFn, capture_propagation_context, task_scope_top,
+    LlmExecutionNextFn, LlmJsonStream, LlmStreamExecutionNextFn, LlmStreamInner,
+    RemoteTraceContext, TASK_SCOPE_STACK, ToolExecutionNextFn, capture_propagation_context,
+    create_scope_stack_with_remote_parent, task_scope_top,
 };
 use nemo_relay::api::runtime::{create_scope_stack, current_scope_stack, set_thread_scope_stack};
 use nemo_relay::api::scope::{EmitMarkEventParams, ScopeHandle, ScopeType, event};
@@ -4261,6 +4262,162 @@ async fn managed_llm_injects_runtime_owned_traceparent() {
     assert!(traceparent.starts_with("00-"));
     assert!(traceparent.ends_with("-01"));
     assert_eq!(traceparent.len(), 55);
+}
+
+#[tokio::test]
+async fn managed_llm_traceparent_preserves_imported_w3c_trace() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    reset_global();
+    let remote_parent = RemoteTraceContext::from_parts(
+        "00112233445566778899aabbccddeeff",
+        "0123456789abcdef",
+        0,
+        Some("vendor=value"),
+    )
+    .unwrap();
+    set_thread_scope_stack(create_scope_stack_with_remote_parent(remote_parent));
+
+    let captured = Arc::new(Mutex::new(None::<LlmRequest>));
+    let captured_request = captured.clone();
+    llm_call_execute(
+        LlmCallExecuteParams::builder()
+            .name("remote-traceparent-test")
+            .request(LlmRequest {
+                headers: serde_json::Map::new(),
+                content: json!({"prompt": "hello"}),
+            })
+            .func(Arc::new(move |request| {
+                *captured_request.lock().unwrap() = Some(request);
+                Box::pin(async { Ok(json!({"ok": true})) })
+            }))
+            .build(),
+    )
+    .await
+    .unwrap();
+
+    let request = captured.lock().unwrap().take().unwrap();
+    let traceparent = request.headers["traceparent"].as_str().unwrap();
+    assert!(traceparent.starts_with("00-00112233445566778899aabbccddeeff-"));
+    assert!(traceparent.ends_with("-00"));
+    assert_eq!(request.headers["tracestate"], json!("vendor=value"));
+}
+
+#[tokio::test]
+async fn managed_llm_without_imported_state_strips_existing_tracestate() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    reset_global();
+    set_thread_scope_stack(create_scope_stack());
+
+    let captured = Arc::new(Mutex::new(None::<LlmRequest>));
+    let captured_request = captured.clone();
+    let mut headers = serde_json::Map::new();
+    headers.insert(
+        "TraceParent".to_string(),
+        json!("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"),
+    );
+    headers.insert("TraceState".to_string(), json!("untrusted=value"));
+    llm_call_execute(
+        LlmCallExecuteParams::builder()
+            .name("ordinary-traceparent-test")
+            .request(LlmRequest {
+                headers,
+                content: json!({"prompt": "hello"}),
+            })
+            .func(Arc::new(move |request| {
+                *captured_request.lock().unwrap() = Some(request);
+                Box::pin(async { Ok(json!({"ok": true})) })
+            }))
+            .build(),
+    )
+    .await
+    .unwrap();
+
+    let request = captured.lock().unwrap().take().unwrap();
+    assert!(
+        request
+            .headers
+            .keys()
+            .all(|key| !key.eq_ignore_ascii_case("tracestate"))
+    );
+    let traceparent = request.headers["traceparent"].as_str().unwrap();
+    assert!(traceparent.starts_with("00-"));
+    assert!(!traceparent.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+}
+
+#[tokio::test]
+async fn standalone_llm_request_intercepts_preserve_existing_w3c_pair_without_local_context() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    reset_global();
+    set_thread_scope_stack(create_scope_stack());
+
+    let mut headers = serde_json::Map::new();
+    headers.insert(
+        "traceparent".to_string(),
+        json!("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"),
+    );
+    headers.insert("tracestate".to_string(), json!("vendor=value"));
+    let outcome = llm_request_intercepts(
+        "standalone-w3c-passthrough",
+        LlmRequest {
+            headers,
+            content: json!({"prompt": "hello"}),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        outcome.request.headers["traceparent"],
+        json!("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01")
+    );
+    assert_eq!(outcome.request.headers["tracestate"], json!("vendor=value"));
+}
+
+#[tokio::test]
+async fn standalone_llm_request_intercepts_replace_w3c_pair_with_local_context() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    reset_global();
+    set_thread_scope_stack(create_scope_stack());
+    let agent = push_scope(
+        nemo_relay::api::scope::PushScopeParams::builder()
+            .name("standalone-parent")
+            .scope_type(ScopeType::Agent)
+            .build(),
+    )
+    .unwrap();
+
+    let mut headers = serde_json::Map::new();
+    headers.insert(
+        "TraceParent".to_string(),
+        json!("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"),
+    );
+    headers.insert("TraceState".to_string(), json!("untrusted=value"));
+    let outcome = llm_request_intercepts(
+        "standalone-w3c-replacement",
+        LlmRequest {
+            headers,
+            content: json!({"prompt": "hello"}),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        outcome
+            .request
+            .headers
+            .keys()
+            .all(|key| !key.eq_ignore_ascii_case("tracestate"))
+    );
+    let traceparent = outcome.request.headers["traceparent"].as_str().unwrap();
+    assert!(traceparent.starts_with("00-"));
+    assert!(!traceparent.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    pop_scope(
+        nemo_relay::api::scope::PopScopeParams::builder()
+            .handle_uuid(&agent.uuid)
+            .build(),
+    )
+    .unwrap();
 }
 
 #[tokio::test]

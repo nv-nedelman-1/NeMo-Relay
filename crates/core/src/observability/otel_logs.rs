@@ -27,7 +27,7 @@ use uuid::Uuid;
 use crate::api::event::{ATOF_VERSION, Event, LOG_SEVERITY_METADATA_KEY, LogSeverity};
 use crate::api::runtime::{EventSubscriberFn, current_scope_stack};
 use crate::api::subscriber::{deregister_subscriber, flush_subscribers, register_subscriber};
-use crate::observability::{relay_span_id, relay_trace_id};
+use crate::observability::{relay_span_id, relay_trace_id, remote_span_context};
 use crate::plugin::OTEL_RUNTIME_DELIVERY_FAILURE_MARKER;
 
 use super::OpenTelemetryRuntimeDiagnostics;
@@ -585,16 +585,16 @@ impl ScopeLineage {
     fn process_start(&mut self, event: &Event) {
         self.remove_completed(event.uuid());
         let parent = self.parent_context(event);
-        let trace_id = parent
+        let (trace_id, trace_flags) = parent
             .as_ref()
-            .map(SpanContext::trace_id)
-            .unwrap_or_else(|| relay_trace_id(event.uuid()));
+            .map(|context| (context.trace_id(), context.trace_flags()))
+            .unwrap_or_else(|| (relay_trace_id(event.uuid()), TraceFlags::SAMPLED));
         self.active.insert(
             event.uuid(),
             SpanContext::new(
                 trace_id,
                 relay_span_id(event.uuid()),
-                TraceFlags::SAMPLED,
+                trace_flags,
                 false,
                 TraceState::default(),
             ),
@@ -618,6 +618,9 @@ impl ScopeLineage {
         }
         let stack = current_scope_stack();
         let stack = stack.read().ok()?;
+        if let Some(remote_parent) = stack.remote_parent_for(parent_uuid) {
+            return Some(remote_span_context(remote_parent));
+        }
         stack.is_propagated_parent(parent_uuid).then(|| {
             SpanContext::new(
                 relay_trace_id(stack.root_uuid()),

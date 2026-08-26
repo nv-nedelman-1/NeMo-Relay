@@ -11,7 +11,7 @@ use crate::api::registry::{EventMetadataInjector, Guardrail, RuntimeRegistration
 use crate::api::runtime::global_context;
 use crate::api::runtime::scope_stack::traceparent_for_llm;
 use crate::api::runtime::{
-    EventSanitizeFn, EventSubscriberFn, NemoRelayContextState, ScopeStackHandle,
+    EventSanitizeFn, EventSubscriberFn, NemoRelayContextState, ScopeStackHandle, capture_tracestate,
 };
 use crate::api::runtime::{current_scope_stack, task_scope_top};
 use crate::api::scope::ScopeHandle;
@@ -28,6 +28,8 @@ pub const DYNAMO_SESSION_ID_HEADER_KEY: &str = "x-dynamo-session-id";
 pub const DYNAMO_PARENT_SESSION_ID_HEADER_KEY: &str = "x-dynamo-parent-session-id";
 /// Header carrying the W3C trace context for an outbound provider request.
 pub const TRACEPARENT_HEADER_KEY: &str = "traceparent";
+/// Header carrying W3C vendor-specific trace state for an outbound request.
+pub const TRACESTATE_HEADER_KEY: &str = "tracestate";
 
 pub(crate) fn resolve_parent_uuid(parent: Option<&ScopeHandle>) -> Option<Uuid> {
     Some(
@@ -238,9 +240,21 @@ pub(crate) fn inject_traceparent_value(request: &mut LlmRequest, value: String) 
         .insert(TRACEPARENT_HEADER_KEY.to_string(), Json::String(value));
 }
 
+pub(crate) fn inject_tracestate_value(request: &mut LlmRequest, value: Option<String>) {
+    request
+        .headers
+        .retain(|key, _| !key.eq_ignore_ascii_case(TRACESTATE_HEADER_KEY));
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        request
+            .headers
+            .insert(TRACESTATE_HEADER_KEY.to_string(), Json::String(value));
+    }
+}
+
 pub(crate) fn inject_traceparent(request: &mut LlmRequest, parent_uuid: Uuid) -> Result<()> {
     let value = traceparent_for_llm(parent_uuid)?;
     inject_traceparent_value(request, value);
+    inject_tracestate_value(request, capture_tracestate()?);
     Ok(())
 }
 

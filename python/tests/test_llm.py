@@ -25,7 +25,10 @@ from nemo_relay import (
     ScopeType,
     capture_propagation_context,
     capture_traceparent,
+    capture_tracestate,
     create_scope_stack_from_propagation,
+    create_scope_stack_with_remote_parent,
+    fork_asyncio_context,
     guardrails,
     intercepts,
     llm,
@@ -672,6 +675,72 @@ class TestLLMInterceptsAsync:
         finally:
             intercepts.deregister_llm_execution("py_llm_capture_propagated_trace_root")
             subscribers.deregister("py_llm_capture_propagated_trace_root")
+
+    async def test_execution_callback_pins_imported_w3c_context(self):
+        stack = create_scope_stack_with_remote_parent(
+            "00112233445566778899aabbccddeeff",
+            "0123456789abcdef",
+            trace_flags=0,
+            tracestate="vendor=value",
+        )
+        events = []
+        observed = []
+        forked = []
+        subscribers.register("py_llm_capture_remote_w3c", events.append)
+
+        async def child():
+            with scope.scope("callback-child", ScopeType.Function) as handle:
+                return handle, capture_traceparent(), capture_tracestate()
+
+        async def execution_intercept(_name, request, next_handler):
+            context = capture_propagation_context()
+            observed.append(
+                (
+                    context.parent_uuid,
+                    context.root_uuid,
+                    capture_traceparent(),
+                    capture_tracestate(),
+                )
+            )
+            forked.append(
+                await asyncio.create_task(
+                    child(),
+                    context=fork_asyncio_context(),
+                )
+            )
+            return await next_handler(request)
+
+        async def provider(_request):
+            return {"ok": True}
+
+        try:
+            intercepts.register_llm_execution(
+                "py_llm_capture_remote_w3c",
+                10,
+                execution_intercept,
+            )
+            with use_scope_stack(stack):
+                assert await llm.execute("py_llm_remote_w3c", make_request(), provider) == {"ok": True}
+            await subscribers.flush_async()
+            start = _llm_event(events, "py_llm_remote_w3c", "start")
+            expected_traceparent = f"00-00112233445566778899aabbccddeeff-{start.uuid.replace('-', '')[-16:]}-00"
+            assert observed == [
+                (
+                    start.uuid,
+                    start.uuid,
+                    expected_traceparent,
+                    "vendor=value",
+                )
+            ]
+            child_handle, child_traceparent, child_tracestate = forked[0]
+            assert child_handle.parent_uuid == start.uuid
+            assert child_traceparent == (
+                f"00-00112233445566778899aabbccddeeff-{child_handle.uuid.replace('-', '')[-16:]}-00"
+            )
+            assert child_tracestate == "vendor=value"
+        finally:
+            intercepts.deregister_llm_execution("py_llm_capture_remote_w3c")
+            subscribers.deregister("py_llm_capture_remote_w3c")
 
     async def test_cancelling_execute_cancels_pending_execution_intercept(self):
         started = asyncio.Event()

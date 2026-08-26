@@ -445,9 +445,31 @@ def create_scope_stack() -> ScopeStack:
     """
     ...
 
+def create_scope_stack_with_remote_parent(
+    trace_id: str,
+    parent_span_id: str,
+    *,
+    trace_flags: int,
+    tracestate: str | None = None,
+) -> ScopeStack:
+    """Create a fresh Relay stack beneath a validated remote OTel parent."""
+    ...
+
+def create_scope_stack_from_propagation_with_remote_parent(
+    context: PropagationContext,
+    trace_id: str,
+    parent_span_id: str,
+    *,
+    trace_flags: int,
+    tracestate: str | None = None,
+) -> ScopeStack:
+    """Create a stack preserving Relay and W3C parentage."""
+    ...
+
 def capture_propagation_context() -> PropagationContext: ...
 def capture_propagation_context_with_root(root_uuid: str | None) -> PropagationContext: ...
 def capture_traceparent() -> str: ...
+def capture_tracestate() -> str | None: ...
 def create_scope_stack_from_propagation(context: PropagationContext) -> ScopeStack: ...
 def fork_asyncio_context() -> contextvars.Context:
     """Create a child asyncio context with an isolated Relay scope stack.
