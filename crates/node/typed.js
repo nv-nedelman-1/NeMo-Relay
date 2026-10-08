@@ -87,6 +87,74 @@ function decodeResponseWithCodec(codec, response) {
   }
 }
 
+const BUILTIN_CODECS = [
+  lib.OpenAIChatCodec,
+  lib.OpenAIResponsesCodec,
+  lib.AnthropicMessagesCodec,
+  lib.GeminiGenerateContentCodec,
+  lib.OCIGenAIChatCodec,
+];
+
+function isBuiltinCodec(codec) {
+  return BUILTIN_CODECS.some((Codec) => typeof Codec === 'function' && codec instanceof Codec);
+}
+
+/**
+ * Native `codecDecode`/`codecEncode` arguments for a request codec.
+ *
+ * @remarks Built-in codec instances pass through so Relay runs the native
+ *   codec and keeps its built-in identity for sanitizers and export presets.
+ */
+function requestCodecArguments(codec) {
+  if (!codec) {
+    return [null, null];
+  }
+  if (isBuiltinCodec(codec)) {
+    return [codec, null];
+  }
+  return [codec.decode.bind(codec), (payload) => encodeWithCodec(codec, payload)];
+}
+
+/** Native `responseCodecDecode` argument for a response codec. */
+function responseCodecArgument(codec) {
+  if (!codec) {
+    return null;
+  }
+  if (isBuiltinCodec(codec)) {
+    return codec;
+  }
+  return (response) => decodeResponseWithCodec(codec, response);
+}
+
+/**
+ * Describe a thrown value the way native callback wrappers report rejections.
+ *
+ * @param {*} error - Thrown value.
+ * @returns {{ message: string, exceptionType: string }}
+ * @remarks Throwing `message` or `name` getters fall back to defaults so a
+ *   failing producer can always end its stream.
+ */
+function describeError(error) {
+  let message = 'unknown error';
+  let exceptionType = 'Error';
+  try {
+    if (typeof error === 'string') {
+      message = error;
+    } else if (error === null || (typeof error !== 'object' && typeof error !== 'function')) {
+      message = String(error);
+    } else if (typeof error.message === 'string') {
+      message = error.message;
+    }
+  } catch {}
+  try {
+    const name = error?.name;
+    if (typeof name === 'string' && name.length > 0) {
+      exceptionType = name;
+    }
+  } catch {}
+  return { message, exceptionType };
+}
+
 /**
  * Execute a typed tool call through the JSON middleware pipeline.
  *
@@ -184,9 +252,8 @@ async function typedLlmExecute(name, request, func, responseJsonCodec, options) 
     opts.data ?? null,
     opts.metadata ?? null,
     opts.modelName ?? null,
-    opts.codec ? opts.codec.decode.bind(opts.codec) : null,
-    opts.codec ? (payload) => encodeWithCodec(opts.codec, payload) : null,
-    opts.responseCodec ? (response) => decodeResponseWithCodec(opts.responseCodec, response) : null,
+    ...requestCodecArguments(opts.codec),
+    responseCodecArgument(opts.responseCodec),
   );
 
   return responseJsonCodec.fromJson(jsonResult);
@@ -227,8 +294,9 @@ async function typedLlmExecute(name, request, func, responseJsonCodec, options) 
  *   Response codec for annotated response events.
  * @returns {Promise<LlmStream>} A promise resolving to the native stream handle.
  * @remarks The JavaScript side drives async iteration and pushes each encoded
- * chunk back into the native stream bridge; the stream is always closed in the
- * `finally` path even if the source iterator throws. Consumers that stop
+ * chunk back into the native stream bridge. If the source iterator throws, the
+ * stream ends with that failure instead of completing, so consumers observe it
+ * from `next()` and the LLM call is recorded as failed. Consumers that stop
  * reading early must await `stream.close()` to complete producer cleanup.
  */
 async function typedLlmStreamExecute(name, request, func, collector, finalizer, ...streamArgs) {
@@ -248,6 +316,8 @@ async function typedLlmStreamExecute(name, request, func, collector, finalizer, 
     const req = wrapper.__nemo_relay_native;
     const streamId = wrapper.__nemo_relay_stream_id;
     (async () => {
+      let failed = false;
+      let failure;
       try {
         iterator = func(req)[Symbol.asyncIterator]();
         resolveIterator(iterator);
@@ -261,13 +331,24 @@ async function typedLlmStreamExecute(name, request, func, collector, finalizer, 
             break;
           }
         }
-      } finally {
-        resolveIterator(iterator);
-        try {
-          await iterator?.return?.();
-        } finally {
-          lib.endStream(streamId);
+      } catch (error) {
+        failed = true;
+        failure = error;
+      }
+      resolveIterator(iterator);
+      try {
+        await iterator?.return?.();
+      } catch (error) {
+        if (!failed) {
+          failed = true;
+          failure = error;
         }
+      }
+      if (failed) {
+        const { message, exceptionType } = describeError(failure);
+        lib.failStream(streamId, message, exceptionType);
+      } else {
+        lib.endStream(streamId);
       }
     })();
   };
@@ -293,9 +374,8 @@ async function typedLlmStreamExecute(name, request, func, collector, finalizer, 
     opts.data ?? null,
     opts.metadata ?? null,
     opts.modelName ?? null,
-    opts.codec ? opts.codec.decode.bind(opts.codec) : null,
-    opts.codec ? (payload) => encodeWithCodec(opts.codec, payload) : null,
-    opts.responseCodec ? (response) => decodeResponseWithCodec(opts.responseCodec, response) : null,
+    ...requestCodecArguments(opts.codec),
+    responseCodecArgument(opts.responseCodec),
   );
   const close = stream.close.bind(stream);
   stream.close = async () => {

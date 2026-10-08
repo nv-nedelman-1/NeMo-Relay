@@ -576,6 +576,34 @@ describe('typedLlmExecute', () => {
     assert.equal(result, 'hello world');
   });
 
+  it('runs built-in request and response codecs natively', async () => {
+    const codec = new OpenAIChatCodec();
+    const observed = [];
+    registerLlmExecutionIntercept('typed_builtin_codec', 10, async (request, context, next) => {
+      observed.push(context.requestCodec.codec, context.responseCodec.codec);
+      return next(request);
+    });
+    try {
+      const result = await typedLlmExecute(
+        'typed_builtin_codec_llm',
+        makeNative(),
+        () => ({ ok: true }),
+        new JsonPassthrough(),
+        {
+          codec,
+          responseCodec: codec,
+        },
+      );
+      assert.deepEqual(result, { ok: true });
+    } finally {
+      deregisterLlmExecutionIntercept('typed_builtin_codec');
+    }
+    assert.deepEqual(observed, [
+      { kind: 'builtin', id: 'openai_chat' },
+      { kind: 'builtin', id: 'openai_chat' },
+    ]);
+  });
+
   it('with modelName option', async () => {
     const passthrough = new JsonPassthrough();
     const native = makeNative();
@@ -836,6 +864,65 @@ describe('typedLlmStreamExecute', () => {
     await closing;
 
     assert.equal(finallyRan, true);
+    assert.equal(await stream.next(), null);
+  });
+
+  it('ends the stream with the failure of a throwing source iterator', async () => {
+    const passthrough = new JsonPassthrough();
+    const events = [];
+    registerSubscriber('typed_stream_failure_sub', (event) => events.push(event));
+    try {
+      async function* failingSource() {
+        yield { token: 'partial' };
+        throw new TypeError('provider stream reset');
+      }
+      const stream = await typedLlmStreamExecute(
+        'typed_stream_failure_llm',
+        makeNative(),
+        failingSource,
+        () => {},
+        () => null,
+        passthrough,
+        passthrough,
+      );
+
+      assert.deepEqual(await stream.next(), { token: 'partial' });
+      await assert.rejects(() => stream.next(), /provider stream reset/);
+      assert.equal(await stream.next(), null);
+      await assert.rejects(() => stream.close(), /provider stream reset/);
+
+      await flushSubscribers();
+      const end = events.find(
+        (event) =>
+          event.name === 'typed_stream_failure_llm' &&
+          event.kind === 'scope' &&
+          event.category === 'llm' &&
+          event.scope_category === 'end',
+      );
+      assert.ok(end, 'expected failed llm end event');
+      assert.equal(end.metadata['otel.status_code'], 'ERROR');
+      assert.match(end.metadata['otel.status_description'], /provider stream reset/);
+      assert.equal(end.metadata['exception.type'], 'TypeError');
+    } finally {
+      deregisterSubscriber('typed_stream_failure_sub');
+    }
+  });
+
+  it('ends the stream with the failure of a source that throws before yielding', async () => {
+    const passthrough = new JsonPassthrough();
+    const stream = await typedLlmStreamExecute(
+      'typed_stream_immediate_failure_llm',
+      makeNative(),
+      () => {
+        throw new Error('provider unavailable');
+      },
+      () => {},
+      () => null,
+      passthrough,
+      passthrough,
+    );
+
+    await assert.rejects(() => stream.next(), /provider unavailable/);
     assert.equal(await stream.next(), null);
   });
 

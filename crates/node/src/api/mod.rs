@@ -102,8 +102,9 @@ use crate::promise_call::PromiseAwareFn;
 use crate::promise_call::with_publication_callback_context;
 use crate::stream::LlmStream;
 use crate::types::{
-    DataSchema, LlmHandle, LogSeverity, MetricMeasurement, MetricTemporality, ScopeHandle,
-    ScopeStack, ScopeType, ToolExecutionResult, ToolHandle,
+    AnthropicMessagesCodec, DataSchema, GeminiGenerateContentCodec, LlmHandle, LogSeverity,
+    MetricMeasurement, MetricTemporality, OCIGenAIChatCodec, OpenAIChatCodec, OpenAIResponsesCodec,
+    ScopeHandle, ScopeStack, ScopeType, ToolExecutionResult, ToolHandle,
 };
 
 #[cfg(test)]
@@ -1215,6 +1216,28 @@ pub fn push_stream_chunk(stream_id: f64, chunk: Json) -> bool {
 pub fn end_stream(env: Env, stream_id: f64) -> napi::Result<()> {
     let id = stream_id as u64;
     finish_stream_channel(id, Ok(()));
+    callback_factory::expire_callback_context(&env)
+}
+
+/// Signal that the producer of a stream failed. The consumer receives the
+/// failure after any chunks already pushed, the managed LLM call ends with an
+/// error status, and closing the stream reports the same failure.
+#[napi]
+pub fn fail_stream(
+    env: Env,
+    stream_id: f64,
+    message: String,
+    exception_type: Option<String>,
+) -> napi::Result<()> {
+    let id = stream_id as u64;
+    if let Some(channel) = STREAM_CHANNELS.lock().unwrap().get(&id) {
+        let _ = channel.sender.send(Err(FlowError::CallbackException {
+            message: message.clone(),
+            exception_type: exception_type.unwrap_or_else(|| "Error".to_string()),
+            source: None,
+        }));
+    }
+    finish_stream_channel(id, Err(message));
     callback_factory::expire_callback_context(&env)
 }
 
@@ -2495,6 +2518,92 @@ type NodeLlmResponseCodec = (
     Vec<Arc<PersistentJsFunction>>,
 );
 
+/// A codec argument of a managed LLM call: a JavaScript callback or a built-in
+/// codec instance. A built-in instance runs Relay's native codec, so sanitizers
+/// and export presets see its built-in codec identity instead of an opaque one.
+type CodecArgument = Either6<
+    &'static OpenAIChatCodec,
+    &'static OpenAIResponsesCodec,
+    &'static AnthropicMessagesCodec,
+    &'static GeminiGenerateContentCodec,
+    &'static OCIGenAIChatCodec,
+    JsFunction,
+>;
+
+fn builtin_codecs(
+    argument: &CodecArgument,
+) -> Option<(
+    Arc<dyn nemo_relay::codec::traits::LlmCodec>,
+    Arc<dyn nemo_relay::codec::traits::LlmResponseCodec>,
+)> {
+    match argument {
+        Either6::A(codec) => Some((
+            codec.inner_codec.clone(),
+            codec.inner_response_codec.clone(),
+        )),
+        Either6::B(codec) => Some((
+            codec.inner_codec.clone(),
+            codec.inner_response_codec.clone(),
+        )),
+        Either6::C(codec) => Some((
+            codec.inner_codec.clone(),
+            codec.inner_response_codec.clone(),
+        )),
+        Either6::D(codec) => Some((
+            codec.inner_codec.clone(),
+            codec.inner_response_codec.clone(),
+        )),
+        Either6::E(codec) => Some((
+            codec.inner_codec.clone(),
+            codec.inner_response_codec.clone(),
+        )),
+        Either6::F(_) => None,
+    }
+}
+
+/// Resolve a managed call's request codec from `codecDecode`/`codecEncode`
+/// callbacks, or from a built-in codec instance passed as `codecDecode`.
+fn node_request_codec(
+    env: &Env,
+    decode: Option<&CodecArgument>,
+    encode: Option<&JsFunction>,
+    references: &mut Vec<Arc<PersistentJsFunction>>,
+) -> napi::Result<Option<Arc<dyn nemo_relay::codec::traits::LlmCodec>>> {
+    match (decode, encode) {
+        (None, None) => Ok(None),
+        (Some(Either6::F(decode)), Some(encode)) => {
+            let (codec, callbacks) = node_llm_codec(env, decode, encode)?;
+            references.extend(callbacks);
+            Ok(Some(codec))
+        }
+        (Some(Either6::F(_)), None) | (None, Some(_)) => Err(napi::Error::from_reason(
+            "codecDecode and codecEncode must be provided together",
+        )),
+        (Some(builtin), None) => Ok(builtin_codecs(builtin).map(|(codec, _)| codec)),
+        (Some(_), Some(_)) => Err(napi::Error::from_reason(
+            "codecEncode must be omitted when codecDecode is a built-in codec instance",
+        )),
+    }
+}
+
+/// Resolve a managed call's response codec from a `responseCodecDecode`
+/// callback or a built-in codec instance.
+fn node_response_codec(
+    env: &Env,
+    decode: Option<&CodecArgument>,
+    references: &mut Vec<Arc<PersistentJsFunction>>,
+) -> napi::Result<Option<Arc<dyn nemo_relay::codec::traits::LlmResponseCodec>>> {
+    match decode {
+        None => Ok(None),
+        Some(Either6::F(decode)) => {
+            let (codec, callbacks) = node_llm_response_codec(env, decode)?;
+            references.extend(callbacks);
+            Ok(Some(codec))
+        }
+        Some(builtin) => Ok(builtin_codecs(builtin).map(|(_, codec)| codec)),
+    }
+}
+
 fn node_llm_codec(
     env: &Env,
     decode: &JsFunction,
@@ -3718,9 +3827,13 @@ pub fn llm_call_execute(
     data: Option<Json>,
     metadata: Option<Json>,
     model_name: Option<String>,
-    #[napi(ts_arg_type = "(arg: Json) => any")] codec_decode: Option<JsFunction>,
+    #[napi(ts_arg_type = "((arg: Json) => any) | BuiltinLlmCodec")] codec_decode: Option<
+        CodecArgument,
+    >,
     #[napi(ts_arg_type = "(arg: Json) => any")] codec_encode: Option<JsFunction>,
-    #[napi(ts_arg_type = "(arg: Json) => any")] response_codec_decode: Option<JsFunction>,
+    #[napi(ts_arg_type = "((arg: Json) => any) | BuiltinLlmCodec")] response_codec_decode: Option<
+        CodecArgument,
+    >,
 ) -> Result<JsObject> {
     let attrs = LlmAttributes::from_bits_truncate(attributes.unwrap_or(0));
     let publication_context_id = callback_factory::event_sanitizer_callback_context_id(&env)?;
@@ -3733,27 +3846,14 @@ pub fn llm_call_execute(
     let callback = callable::safe_execution_callback(&env, &func)?;
     let default_fn = scoped_llm_execution_fn(scoped_json_callback_tsfn(&env, &callback)?);
     let mut codec_references = Vec::new();
-    let codec = match (codec_decode.as_ref(), codec_encode.as_ref()) {
-        (Some(d), Some(e)) => {
-            let (codec, references) = node_llm_codec(&env, d, e)?;
-            codec_references.extend(references);
-            Some(codec)
-        }
-        (None, None) => None,
-        _ => {
-            return Err(napi::Error::from_reason(
-                "codecDecode and codecEncode must be provided together",
-            ));
-        }
-    };
-    let response_codec = response_codec_decode
-        .as_ref()
-        .map(|decode| node_llm_response_codec(&env, decode))
-        .transpose()?
-        .map(|(codec, references)| {
-            codec_references.extend(references);
-            codec
-        });
+    let codec = node_request_codec(
+        &env,
+        codec_decode.as_ref(),
+        codec_encode.as_ref(),
+        &mut codec_references,
+    )?;
+    let response_codec =
+        node_response_codec(&env, response_codec_decode.as_ref(), &mut codec_references)?;
     env.execute_tokio_future(
         async move {
             with_publication_callback_context(
@@ -3808,9 +3908,13 @@ pub fn llm_call_execute_async(
     data: Option<Json>,
     metadata: Option<Json>,
     model_name: Option<String>,
-    #[napi(ts_arg_type = "(arg: Json) => any")] codec_decode: Option<JsFunction>,
+    #[napi(ts_arg_type = "((arg: Json) => any) | BuiltinLlmCodec")] codec_decode: Option<
+        CodecArgument,
+    >,
     #[napi(ts_arg_type = "(arg: Json) => any")] codec_encode: Option<JsFunction>,
-    #[napi(ts_arg_type = "(arg: Json) => any")] response_codec_decode: Option<JsFunction>,
+    #[napi(ts_arg_type = "((arg: Json) => any) | BuiltinLlmCodec")] response_codec_decode: Option<
+        CodecArgument,
+    >,
 ) -> Result<JsObject> {
     let attrs = LlmAttributes::from_bits_truncate(attributes.unwrap_or(0));
     let publication_context_id = callback_factory::event_sanitizer_callback_context_id(&env)?;
@@ -3833,27 +3937,14 @@ pub fn llm_call_execute_async(
     });
 
     let mut codec_references = Vec::new();
-    let codec = match (codec_decode.as_ref(), codec_encode.as_ref()) {
-        (Some(d), Some(e)) => {
-            let (codec, references) = node_llm_codec(&env, d, e)?;
-            codec_references.extend(references);
-            Some(codec)
-        }
-        (None, None) => None,
-        _ => {
-            return Err(napi::Error::from_reason(
-                "codecDecode and codecEncode must be provided together",
-            ));
-        }
-    };
-    let response_codec = response_codec_decode
-        .as_ref()
-        .map(|decode| node_llm_response_codec(&env, decode))
-        .transpose()?
-        .map(|(codec, references)| {
-            codec_references.extend(references);
-            codec
-        });
+    let codec = node_request_codec(
+        &env,
+        codec_decode.as_ref(),
+        codec_encode.as_ref(),
+        &mut codec_references,
+    )?;
+    let response_codec =
+        node_response_codec(&env, response_codec_decode.as_ref(), &mut codec_references)?;
 
     env.execute_tokio_future(
         async move {
@@ -3922,9 +4013,13 @@ pub fn llm_stream_call_execute(
     data: Option<Json>,
     metadata: Option<Json>,
     model_name: Option<String>,
-    #[napi(ts_arg_type = "(arg: Json) => any")] codec_decode: Option<JsFunction>,
+    #[napi(ts_arg_type = "((arg: Json) => any) | BuiltinLlmCodec")] codec_decode: Option<
+        CodecArgument,
+    >,
     #[napi(ts_arg_type = "(arg: Json) => any")] codec_encode: Option<JsFunction>,
-    #[napi(ts_arg_type = "(arg: Json) => any")] response_codec_decode: Option<JsFunction>,
+    #[napi(ts_arg_type = "((arg: Json) => any) | BuiltinLlmCodec")] response_codec_decode: Option<
+        CodecArgument,
+    >,
 ) -> Result<JsObject> {
     let attrs = LlmAttributes::from_bits_truncate(attributes.unwrap_or(0));
     let publication_context_id = callback_factory::event_sanitizer_callback_context_id(&env)?;
@@ -3985,27 +4080,14 @@ pub fn llm_stream_call_execute(
     });
 
     let mut codec_references = Vec::new();
-    let codec = match (codec_decode.as_ref(), codec_encode.as_ref()) {
-        (Some(d), Some(e)) => {
-            let (codec, references) = node_llm_codec(&env, d, e)?;
-            codec_references.extend(references);
-            Some(codec)
-        }
-        (None, None) => None,
-        _ => {
-            return Err(napi::Error::from_reason(
-                "codecDecode and codecEncode must be provided together",
-            ));
-        }
-    };
-    let response_codec = response_codec_decode
-        .as_ref()
-        .map(|decode| node_llm_response_codec(&env, decode))
-        .transpose()?
-        .map(|(codec, references)| {
-            codec_references.extend(references);
-            codec
-        });
+    let codec = node_request_codec(
+        &env,
+        codec_decode.as_ref(),
+        codec_encode.as_ref(),
+        &mut codec_references,
+    )?;
+    let response_codec =
+        node_response_codec(&env, response_codec_decode.as_ref(), &mut codec_references)?;
     let completion_codec_references = codec_references.clone();
     env.execute_tokio_future(
         async move {

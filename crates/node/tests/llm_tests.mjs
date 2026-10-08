@@ -1830,6 +1830,106 @@ describe('LLM intercepts', () => {
     }
   });
 
+  it('managed calls run built-in codec instances natively with their built-in identity', async () => {
+    const codec = new lib.OpenAIChatCodec();
+    const response = {
+      id: 'chatcmpl-builtin-codec',
+      model: 'test-model',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    };
+    const observed = [];
+    registerLlmExecutionIntercept('node_llm_builtin_codec', 10, async (request, context, next) => {
+      observed.push([context.requestCodec.codec, context.responseCodec.codec]);
+      assert.equal(context.requestCodec.resolveCodec().decode(request).model, 'test-model');
+      return next(request);
+    });
+    registerLlmStreamExecutionIntercept('node_llm_builtin_codec_stream', 10, async (request, context, next) => {
+      observed.push([context.requestCodec.codec, context.responseCodec]);
+      return next(request);
+    });
+    try {
+      const unary = await llmCallExecute(
+        'node_llm_builtin_codec',
+        makeNative(),
+        () => response,
+        null,
+        null,
+        null,
+        null,
+        null,
+        codec,
+        null,
+        codec,
+      );
+      const promised = await llmCallExecuteAsync(
+        'node_llm_builtin_codec_async',
+        makeNative(),
+        async () => response,
+        null,
+        null,
+        null,
+        null,
+        null,
+        codec,
+        null,
+        codec,
+      );
+      const stream = await llmStreamCallExecute(
+        'node_llm_builtin_codec_stream',
+        makeNative(),
+        (wrapper) => {
+          lib.pushStreamChunk(wrapper.__nemo_relay_stream_id, { token: 'ok' });
+          lib.endStream(wrapper.__nemo_relay_stream_id);
+        },
+        null,
+        () => ({}),
+        null,
+        null,
+        null,
+        null,
+        null,
+        codec,
+        null,
+        codec,
+      );
+      assert.deepEqual(unary, response);
+      assert.deepEqual(promised, response);
+      assert.deepEqual(await stream.next(), { token: 'ok' });
+      assert.equal(await stream.next(), null);
+    } finally {
+      deregisterLlmExecutionIntercept('node_llm_builtin_codec');
+      deregisterLlmStreamExecutionIntercept('node_llm_builtin_codec_stream');
+    }
+
+    const builtin = { kind: 'builtin', id: 'openai_chat' };
+    assert.deepEqual(observed, [
+      [builtin, builtin],
+      [builtin, builtin],
+      [builtin, null],
+    ]);
+  });
+
+  it('rejects a built-in codec instance combined with an encode callback', () => {
+    const codec = new lib.OpenAIChatCodec();
+    assert.throws(
+      () =>
+        llmCallExecute(
+          'node_llm_builtin_codec_mixed',
+          makeNative(),
+          () => ({}),
+          null,
+          null,
+          null,
+          null,
+          null,
+          codec,
+          ({ annotated, original }) => codec.encode(annotated, original),
+          null,
+        ),
+      /codecEncode must be omitted when codecDecode is a built-in codec instance/,
+    );
+  });
+
   it('execution intercept rejects a detached next call after settlement', async () => {
     let releaseLateNext;
     const lateGate = new Promise((resolve) => {

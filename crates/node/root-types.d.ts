@@ -262,3 +262,14 @@ export type EventMetadataValue = EventMetadataScalar | string[] | number[] | boo
 
 /** Metadata additions returned by an event metadata injector. */
 export type EventMetadata = Record<string, EventMetadataValue>;
+
+/**
+ * Built-in codec instance accepted by managed LLM calls in place of codec
+ * callbacks. Relay then runs the native codec and keeps its built-in identity.
+ */
+export type BuiltinLlmCodec =
+  | OpenAIChatCodec
+  | OpenAIResponsesCodec
+  | AnthropicMessagesCodec
+  | GeminiGenerateContentCodec
+  | OCIGenAIChatCodec;
