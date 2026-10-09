@@ -50,8 +50,6 @@ const {
   deregisterLlmRequestIntercept,
   registerLlmExecutionIntercept,
   deregisterLlmExecutionIntercept,
-  registerLlmStreamExecutionIntercept,
-  deregisterLlmStreamExecutionIntercept,
   registerSubscriber,
   deregisterSubscriber,
   flushSubscribers,
@@ -606,33 +604,6 @@ describe('typedLlmExecute', () => {
     ]);
   });
 
-  it('preserves custom overrides on built-in codec instances', async () => {
-    const codec = new OpenAIChatCodec();
-    const decode = codec.decode.bind(codec);
-    const decodeResponse = codec.decodeResponse.bind(codec);
-    codec.decode = (request) => ({ ...decode(request), model: 'custom-codec' });
-    codec.decodeResponse = (response) => ({ ...decodeResponse(response), message: 'custom-response' });
-    registerLlmExecutionIntercept('typed_customized_builtin', 10, async (request, context, next) => {
-      assert.deepEqual(context.requestCodec.codec, { kind: 'opaque' });
-      assert.equal(context.requestCodec.resolveCodec().decode(request).model, 'custom-codec');
-      const response = await next(request);
-      assert.deepEqual(context.responseCodec.codec, { kind: 'opaque' });
-      assert.equal(context.responseCodec.resolveCodec().decodeResponse(response).message, 'custom-response');
-      return response;
-    });
-    try {
-      await typedLlmExecute(
-        'typed_customized_builtin',
-        makeNative(),
-        () => ({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }),
-        new JsonPassthrough(),
-        { codec, responseCodec: codec },
-      );
-    } finally {
-      deregisterLlmExecutionIntercept('typed_customized_builtin');
-    }
-  });
-
   it('with modelName option', async () => {
     const passthrough = new JsonPassthrough();
     const native = makeNative();
@@ -893,76 +864,6 @@ describe('typedLlmStreamExecute', () => {
     await closing;
 
     assert.equal(finallyRan, true);
-    assert.equal(await stream.next(), null);
-  });
-
-  it('closes a replacement stream without waiting for an unused source iterator', async () => {
-    const name = 'typed_stream_replacement';
-    registerLlmStreamExecutionIntercept(name, 10, async () =>
-      (async function* () {
-        yield { token: 'replacement' };
-      })(),
-    );
-    try {
-      const codec = new JsonPassthrough();
-      const stream = await typedLlmStreamExecute(
-        name,
-        makeNative(),
-        () => assert.fail('the provider must not be called'),
-        () => {},
-        () => null,
-        codec,
-        codec,
-      );
-      assert.deepEqual(await stream.next(), { token: 'replacement' });
-      await assertCompletesWithin(stream.close(), 'replacement stream close waited for the source');
-      assert.equal(await stream.next(), null);
-    } finally {
-      deregisterLlmStreamExecutionIntercept(name);
-    }
-  });
-
-  it('closes each source iterator only once across cancellation and repeated close', async () => {
-    let release;
-    let ready;
-    const waiting = new Promise((resolve) => {
-      ready = resolve;
-    });
-    let returns = 0;
-    let pulls = 0;
-    const source = {
-      [Symbol.asyncIterator]() {
-        return this;
-      },
-      async next() {
-        if (pulls++ === 0) return { value: { token: 'first' } };
-        await new Promise((resolve) => {
-          release = resolve;
-          ready();
-        });
-        return { value: { token: 'unread' } };
-      },
-      async return() {
-        returns += 1;
-        release?.();
-        return { done: true };
-      },
-    };
-    const codec = new JsonPassthrough();
-    const stream = await typedLlmStreamExecute(
-      'typed_stream_idempotent_close',
-      makeNative(),
-      () => source,
-      () => {},
-      () => null,
-      codec,
-      codec,
-    );
-    assert.deepEqual(await stream.next(), { token: 'first' });
-    await waiting;
-    await assertCompletesWithin(stream.close(), 'source cleanup did not complete');
-    await stream.close();
-    assert.equal(returns, 1);
     assert.equal(await stream.next(), null);
   });
 

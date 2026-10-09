@@ -210,9 +210,6 @@ export interface TypedLlmStreamExecuteOptions {
  * before entering the middleware pipeline. After interception, chunks are
  * converted back via `chunkCodec.fromJson` before reaching `collector`.
  * The `finalizer` result is converted via `responseCodec.toJson`.
- * Source failures propagate through `next()` and are recorded as failed LLM calls.
- * Await `stream.close()` when stopping early; it closes each started source
- * iterator once, including when middleware replaces the provider stream.
  *
  * @param name - Model/provider name.
  * @param request - The LLM request object ({headers, content}).

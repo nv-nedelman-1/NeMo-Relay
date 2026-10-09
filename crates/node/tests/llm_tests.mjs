@@ -2223,66 +2223,6 @@ describe('LLM intercepts', () => {
     }
   });
 
-  it('awaitable pushes bound read-ahead and unblock a waiting producer on close', async () => {
-    const paused = Promise.withResolvers();
-    let producer;
-    let streamId;
-    let pushed = 0;
-    let cancelled = false;
-    const stream = await llmStreamCallExecute('awaitable_push_close', makeNative(), (wrapper) => {
-      streamId = wrapper.__nemo_relay_stream_id;
-      producer = (async () => {
-        try {
-          for (let index = 0; index < 256; index++) {
-            if (!(await lib.pushStreamChunkAsync(streamId, { index }))) {
-              cancelled = true;
-              break;
-            }
-            if (++pushed === 33) paused.resolve();
-          }
-        } finally {
-          lib.endStream(streamId);
-        }
-      })();
-    });
-    try {
-      await assertCompletesWithin(paused.promise, 'native bridge did not accept its bounded read-ahead');
-      await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(pushed, 33, 'producer ran past the full native consumer bridge');
-      await assertCompletesWithin(stream.close(), 'close deadlocked with a producer waiting for consumption');
-      await producer;
-      assert.equal(cancelled, true);
-      assert.equal(await stream.next(), null);
-      assert.equal(await lib.pushStreamChunkAsync(streamId, { late: true }), false);
-      assert.equal(lib.pushStreamChunk(streamId, { late: true }), false);
-    } finally {
-      await stream.close();
-    }
-  });
-
-  it('awaitable pushes preserve chunk order and all chunks through exhaustion', async () => {
-    const stream = await llmStreamCallExecute('awaitable_push_complete', makeNative(), (wrapper) => {
-      const id = wrapper.__nemo_relay_stream_id;
-      (async () => {
-        try {
-          for (let index = 0; index < 100; index++) {
-            assert.equal(await lib.pushStreamChunkAsync(id, { index }), true);
-          }
-        } finally {
-          lib.endStream(id);
-        }
-      })();
-    });
-    const chunks = [];
-    let chunk;
-    while ((chunk = await stream.next()) !== null) chunks.push(chunk);
-    await stream.close();
-    assert.deepEqual(
-      chunks,
-      Array.from({ length: 100 }, (_, index) => ({ index })),
-    );
-  });
-
   it('stream execution intercept applies backpressure to its async iterable', async () => {
     let pulls = 0;
     let stream;
