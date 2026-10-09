@@ -302,11 +302,8 @@ async function typedLlmExecute(name, request, func, responseJsonCodec, options) 
 async function typedLlmStreamExecute(name, request, func, collector, finalizer, ...streamArgs) {
   const [chunkJsonCodec, responseJsonCodec, options] = streamArgs;
   const opts = options || {};
-  let iterator;
-  let resolveIterator;
-  const iteratorReady = new Promise((resolve) => {
-    resolveIterator = resolve;
-  });
+  const closeIterators = new Set();
+  let closing = false;
 
   // Push-based stream bridge: NAPI cannot resolve JS Promises from
   // call_with_return_value, so the JS side drives async generator iteration
@@ -316,18 +313,20 @@ async function typedLlmStreamExecute(name, request, func, collector, finalizer, 
     const req = wrapper.__nemo_relay_native;
     const streamId = wrapper.__nemo_relay_stream_id;
     (async () => {
+      let iterator;
+      let returned;
+      const closeIterator = () => (returned ??= Promise.resolve().then(() => iterator?.return?.()));
+      closeIterators.add(closeIterator);
       let failed = false;
       let failure;
       try {
         iterator = func(req)[Symbol.asyncIterator]();
-        resolveIterator(iterator);
-        while (true) {
+        while (!closing) {
           const { done, value: typedChunk } = await iterator.next();
           if (done) {
             break;
           }
           if (!lib.pushStreamChunk(streamId, chunkJsonCodec.toJson(typedChunk))) {
-            await iterator.return?.();
             break;
           }
         }
@@ -335,15 +334,15 @@ async function typedLlmStreamExecute(name, request, func, collector, finalizer, 
         failed = true;
         failure = error;
       }
-      resolveIterator(iterator);
       try {
-        await iterator?.return?.();
+        await closeIterator();
       } catch (error) {
         if (!failed) {
           failed = true;
           failure = error;
         }
       }
+      closeIterators.delete(closeIterator);
       if (failed) {
         const { message, exceptionType } = describeError(failure);
         lib.failStream(streamId, message, exceptionType);
@@ -378,32 +377,15 @@ async function typedLlmStreamExecute(name, request, func, collector, finalizer, 
     responseCodecArgument(opts.responseCodec),
   );
   const close = stream.close.bind(stream);
-  stream.close = async () => {
-    const closing = close();
-    let iteratorError;
-    try {
-      await (await iteratorReady)?.return?.();
-    } catch (error) {
-      iteratorError = error;
-    }
-    let closeError;
-    try {
-      await closing;
-    } catch (error) {
-      closeError = error;
-    }
-    if (iteratorError && closeError) {
-      throw new AggregateError(
-        [iteratorError, closeError],
-        'stream close failed during iterator cleanup and native close',
-      );
-    }
-    if (iteratorError) {
-      throw iteratorError;
-    }
-    if (closeError) {
-      throw closeError;
-    }
+  let closeResult;
+  stream.close = () => {
+    closing = true;
+    return (closeResult ??= (async () => {
+      const results = await Promise.allSettled([close(), ...[...closeIterators].map((cleanup) => cleanup())]);
+      const errors = results.flatMap((result) => (result.status === 'rejected' ? [result.reason] : []));
+      if (errors.length === 1) throw errors[0];
+      if (errors.length > 1) throw new AggregateError(errors, 'stream close failed during producer cleanup');
+    })());
   };
   return stream;
 }

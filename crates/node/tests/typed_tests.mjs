@@ -50,6 +50,8 @@ const {
   deregisterLlmRequestIntercept,
   registerLlmExecutionIntercept,
   deregisterLlmExecutionIntercept,
+  registerLlmStreamExecutionIntercept,
+  deregisterLlmStreamExecutionIntercept,
   registerSubscriber,
   deregisterSubscriber,
   flushSubscribers,
@@ -864,6 +866,76 @@ describe('typedLlmStreamExecute', () => {
     await closing;
 
     assert.equal(finallyRan, true);
+    assert.equal(await stream.next(), null);
+  });
+
+  it('closes a replacement stream without waiting for an unused source iterator', async () => {
+    const name = 'typed_stream_replacement';
+    registerLlmStreamExecutionIntercept(name, 10, async () =>
+      (async function* () {
+        yield { token: 'replacement' };
+      })(),
+    );
+    try {
+      const codec = new JsonPassthrough();
+      const stream = await typedLlmStreamExecute(
+        name,
+        makeNative(),
+        () => assert.fail('the provider must not be called'),
+        () => {},
+        () => null,
+        codec,
+        codec,
+      );
+      assert.deepEqual(await stream.next(), { token: 'replacement' });
+      await assertCompletesWithin(stream.close(), 'replacement stream close waited for the source');
+      assert.equal(await stream.next(), null);
+    } finally {
+      deregisterLlmStreamExecutionIntercept(name);
+    }
+  });
+
+  it('closes each source iterator only once across cancellation and repeated close', async () => {
+    let release;
+    let ready;
+    const waiting = new Promise((resolve) => {
+      ready = resolve;
+    });
+    let returns = 0;
+    let pulls = 0;
+    const source = {
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+      async next() {
+        if (pulls++ === 0) return { value: { token: 'first' } };
+        await new Promise((resolve) => {
+          release = resolve;
+          ready();
+        });
+        return { value: { token: 'unread' } };
+      },
+      async return() {
+        returns += 1;
+        release?.();
+        return { done: true };
+      },
+    };
+    const codec = new JsonPassthrough();
+    const stream = await typedLlmStreamExecute(
+      'typed_stream_idempotent_close',
+      makeNative(),
+      () => source,
+      () => {},
+      () => null,
+      codec,
+      codec,
+    );
+    assert.deepEqual(await stream.next(), { token: 'first' });
+    await waiting;
+    await assertCompletesWithin(stream.close(), 'source cleanup did not complete');
+    await stream.close();
+    assert.equal(returns, 1);
     assert.equal(await stream.next(), null);
   });
 
