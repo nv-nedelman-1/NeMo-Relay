@@ -96,7 +96,12 @@ const BUILTIN_CODECS = [
 ];
 
 function isBuiltinCodec(codec) {
-  return BUILTIN_CODECS.some((Codec) => typeof Codec === 'function' && codec instanceof Codec);
+  return BUILTIN_CODECS.some(
+    (Codec) =>
+      typeof Codec === 'function' &&
+      codec instanceof Codec &&
+      ['decode', 'encode', 'decodeResponse'].every((method) => codec[method] === Codec.prototype[method]),
+  );
 }
 
 /**

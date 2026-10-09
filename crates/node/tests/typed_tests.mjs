@@ -606,6 +606,33 @@ describe('typedLlmExecute', () => {
     ]);
   });
 
+  it('preserves custom overrides on built-in codec instances', async () => {
+    const codec = new OpenAIChatCodec();
+    const decode = codec.decode.bind(codec);
+    const decodeResponse = codec.decodeResponse.bind(codec);
+    codec.decode = (request) => ({ ...decode(request), model: 'custom-codec' });
+    codec.decodeResponse = (response) => ({ ...decodeResponse(response), message: 'custom-response' });
+    registerLlmExecutionIntercept('typed_customized_builtin', 10, async (request, context, next) => {
+      assert.deepEqual(context.requestCodec.codec, { kind: 'opaque' });
+      assert.equal(context.requestCodec.resolveCodec().decode(request).model, 'custom-codec');
+      const response = await next(request);
+      assert.deepEqual(context.responseCodec.codec, { kind: 'opaque' });
+      assert.equal(context.responseCodec.resolveCodec().decodeResponse(response).message, 'custom-response');
+      return response;
+    });
+    try {
+      await typedLlmExecute(
+        'typed_customized_builtin',
+        makeNative(),
+        () => ({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }),
+        new JsonPassthrough(),
+        { codec, responseCodec: codec },
+      );
+    } finally {
+      deregisterLlmExecutionIntercept('typed_customized_builtin');
+    }
+  });
+
   it('with modelName option', async () => {
     const passthrough = new JsonPassthrough();
     const native = makeNative();
