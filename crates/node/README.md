@@ -119,6 +119,15 @@ const execution = await toolCallExecuteAsync('lookup', { query: 'relay' }, async
 console.log(execution.result.answer);
 ```
 
+For raw push-based LLM streams, await `pushStreamChunkAsync(streamId, chunk)`
+before reading the next provider chunk. It acknowledges native consumption and
+returns `false` when the stream closes or is cancelled; then stop the producer
+and call `endStream(streamId)` after cleanup. This bounds producer read-ahead
+behind Relay's consumer bridge. The synchronous `pushStreamChunk()` remains
+available but does not provide backpressure. Typed streaming helpers use the
+awaitable API when available. Neither API bounds the size of an individual
+chunk or data the application chooses to retain.
+
 The core mark contract uses positional optional arguments. Pass `null` for
 `dataSchema` before supplying the final `severity` argument:
 

@@ -1053,8 +1053,13 @@ fn build_atof_config(
 
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(0);
 
-type StreamSender = tokio::sync::mpsc::UnboundedSender<FlowResult<Json>>;
+type StreamSender = tokio::sync::mpsc::UnboundedSender<StreamChunk>;
 type RustJsonStream = LlmJsonStream;
+
+struct StreamChunk {
+    value: FlowResult<Json>,
+    consumed: Option<tokio::sync::oneshot::Sender<()>>,
+}
 
 struct StreamChannel {
     sender: StreamSender,
@@ -1159,7 +1164,7 @@ pub(crate) fn llm_stream_from_rust_stream(rust_stream: RustJsonStream) -> LlmStr
 }
 
 struct NodePushStream {
-    receiver: tokio_stream::wrappers::UnboundedReceiverStream<FlowResult<Json>>,
+    receiver: tokio::sync::mpsc::UnboundedReceiver<StreamChunk>,
     stream_id: u64,
     closed: tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>,
 }
@@ -1168,7 +1173,14 @@ impl Stream for NodePushStream {
     type Item = FlowResult<Json>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.receiver).poll_next(cx)
+        self.receiver.poll_recv(cx).map(|chunk| {
+            chunk.map(|chunk| {
+                if let Some(consumed) = chunk.consumed {
+                    let _ = consumed.send(());
+                }
+                chunk.value
+            })
+        })
     }
 }
 
@@ -1180,10 +1192,13 @@ impl Drop for NodePushStream {
 
 impl LlmStreamInner for NodePushStream {
     fn close(self: Pin<&mut Self>) -> Pin<Box<dyn Future<Output = FlowResult<()>> + Send + '_>> {
-        let stream_id = self.stream_id;
-        let mut closed = self.get_mut().closed.clone();
+        let stream = self.get_mut();
+        cancel_stream_channel(stream.stream_id);
+        stream.receiver.close();
+        // Wake a producer awaiting consumption before waiting for its cleanup.
+        while stream.receiver.try_recv().is_ok() {}
+        let mut closed = stream.closed.clone();
         Box::pin(async move {
-            cancel_stream_channel(stream_id);
             while closed.borrow().is_none() {
                 closed.changed().await.map_err(|_| {
                     FlowError::Internal("JS stream cleanup task ended early".into())
@@ -1204,10 +1219,45 @@ impl LlmStreamInner for NodePushStream {
 pub fn push_stream_chunk(stream_id: f64, chunk: Json) -> bool {
     let id = stream_id as u64;
     if let Some(channel) = STREAM_CHANNELS.lock().unwrap().get(&id) {
-        !channel.cancelled.load(Ordering::Acquire) && channel.sender.send(Ok(chunk)).is_ok()
+        !channel.cancelled.load(Ordering::Acquire)
+            && channel
+                .sender
+                .send(StreamChunk {
+                    value: Ok(chunk),
+                    consumed: None,
+                })
+                .is_ok()
     } else {
         false
     }
+}
+
+/// Push a chunk and wait until the native stream pulls it. Returns false when
+/// the stream is cancelled, closed, or unknown. Producers must await each push
+/// before producing another chunk to keep their read-ahead bounded.
+#[napi]
+pub async fn push_stream_chunk_async(stream_id: f64, chunk: Json) -> bool {
+    let channel = STREAM_CHANNELS
+        .lock()
+        .unwrap()
+        .get(&(stream_id as u64))
+        .cloned();
+    let Some(channel) = channel else {
+        return false;
+    };
+    let (consumed, received) = tokio::sync::oneshot::channel();
+    if channel.cancelled.load(Ordering::Acquire)
+        || channel
+            .sender
+            .send(StreamChunk {
+                value: Ok(chunk),
+                consumed: Some(consumed),
+            })
+            .is_err()
+    {
+        return false;
+    }
+    received.await.is_ok()
 }
 
 /// Signal that a stream is complete. Drops the sender so the Rust
@@ -1231,11 +1281,14 @@ pub fn fail_stream(
 ) -> napi::Result<()> {
     let id = stream_id as u64;
     if let Some(channel) = STREAM_CHANNELS.lock().unwrap().get(&id) {
-        let _ = channel.sender.send(Err(FlowError::CallbackException {
-            message: message.clone(),
-            exception_type: exception_type.unwrap_or_else(|| "Error".to_string()),
-            source: None,
-        }));
+        let _ = channel.sender.send(StreamChunk {
+            value: Err(FlowError::CallbackException {
+                message: message.clone(),
+                exception_type: exception_type.unwrap_or_else(|| "Error".to_string()),
+                source: None,
+            }),
+            consumed: None,
+        });
     }
     finish_stream_channel(id, Err(message));
     callback_factory::expire_callback_context(&env)
@@ -4072,7 +4125,7 @@ pub fn llm_stream_call_execute(
             ensure_stream_callback_queued(stream_id, call_status)?;
 
             Ok(LlmJsonStream::from_closeable(NodePushStream {
-                receiver: tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+                receiver: rx,
                 stream_id,
                 closed,
             }))
