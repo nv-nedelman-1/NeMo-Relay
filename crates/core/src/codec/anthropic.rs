@@ -30,8 +30,8 @@ use super::request::{
 };
 use super::resolve::{ProviderSurface, ProviderSurfaceDescriptor};
 use super::response::{
-    AnnotatedLlmResponse, ApiSpecificResponse, FinishReason, RawProviderCost, ResponseToolCall,
-    Usage, estimate_cost_for_provider, infer_model_provider, provider_reported_cost,
+    AnnotatedLlmResponse, ApiSpecificResponse, FinishReason, RawUsageCost, ResponseToolCall, Usage,
+    estimate_cost_for_provider, infer_model_provider, provider_reported_cost,
 };
 use super::traits::{LlmCodec, LlmResponseCodec};
 
@@ -96,7 +96,7 @@ struct RawAnthropicUsage {
     iterations: Option<Vec<RawAnthropicIterationUsage>>,
     #[serde(rename = "cost_usd")]
     provider_cost: Option<f64>,
-    cost: Option<RawProviderCost>,
+    cost: Option<RawUsageCost>,
 }
 
 #[derive(Deserialize)]
@@ -946,7 +946,6 @@ fn anthropic_usage(
                 sum_iteration_field(values, |value| value.cache_creation_input_tokens)
             })
             .or(u.cache_creation_input_tokens);
-        let (scalar_provider_cost, detailed_cost) = RawProviderCost::split(u.cost);
         let mut usage = Usage {
             prompt_tokens: prompt,
             completion_tokens: completion,
@@ -958,7 +957,7 @@ fn anthropic_usage(
             cache_read_tokens,
             cache_write_tokens,
             uncached_input_tokens: prompt,
-            cost: provider_reported_cost(u.provider_cost.or(scalar_provider_cost), detailed_cost),
+            cost: provider_reported_cost(u.provider_cost, u.cost),
         };
         if usage.cost.is_none() && iteration_models_match_response(iterations, model_for_pricing) {
             usage.cost = model_for_pricing.and_then(|model| {

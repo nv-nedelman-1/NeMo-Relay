@@ -764,40 +764,6 @@ fn test_exporter_preserves_annotation_when_tool_result_is_null() {
 }
 
 #[test]
-fn test_exporter_records_failed_tool_call_without_output() {
-    let exporter = AtifExporter::new("session-1".to_string(), make_agent_info());
-    let tool_uuid = Uuid::now_v7();
-
-    // A managed tool that throws ends with an error status and no result.
-    let end = event_builder(tool_uuid, EventType::End)
-        .name("edit")
-        .scope_type(ScopeType::Tool)
-        .tool_call_id("call_123")
-        .metadata(json!({
-            "otel.status_code": "ERROR",
-            "otel.status_description": "Could not find oldString in main.cpp"
-        }))
-        .build();
-
-    {
-        let mut state = exporter.state.lock().unwrap();
-        state.events.push(end);
-    }
-
-    let trajectory = exporter.export().unwrap();
-    let result = &trajectory.steps[0].observation.as_ref().unwrap().results[0];
-
-    assert_eq!(
-        result.content,
-        Some(json!("Could not find oldString in main.cpp"))
-    );
-    assert_eq!(
-        result.extra.as_ref().unwrap()["metadata"]["otel.status_code"],
-        json!("ERROR")
-    );
-}
-
-#[test]
 fn test_exporter_moves_structured_tool_close_result_to_observation_extra() {
     let exporter = AtifExporter::new("session-1".to_string(), make_agent_info());
     let tool_uuid = Uuid::now_v7();

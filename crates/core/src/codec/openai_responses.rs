@@ -34,8 +34,8 @@ use super::request::{
 };
 use super::resolve::{ProviderSurface, ProviderSurfaceDescriptor};
 use super::response::{
-    AnnotatedLlmResponse, ApiSpecificResponse, FinishReason, RawProviderCost, ResponseToolCall,
-    Usage, estimate_cost_for_provider, infer_model_provider, provider_reported_cost,
+    AnnotatedLlmResponse, ApiSpecificResponse, FinishReason, RawUsageCost, ResponseToolCall, Usage,
+    estimate_cost_for_provider, infer_model_provider, provider_reported_cost,
 };
 use super::traits::{LlmCodec, LlmResponseCodec};
 
@@ -91,7 +91,7 @@ struct RawResponsesUsage {
     output_tokens_details: Option<RawOutputTokensDetails>,
     #[serde(rename = "cost_usd")]
     provider_cost: Option<f64>,
-    cost: Option<RawProviderCost>,
+    cost: Option<RawUsageCost>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -1277,7 +1277,6 @@ impl LlmResponseCodec for OpenAIResponsesCodec {
                 .input_tokens_details
                 .as_ref()
                 .and_then(|details| details.cached_tokens);
-            let (scalar_provider_cost, detailed_cost) = RawProviderCost::split(u.cost);
             let mut usage = Usage {
                 prompt_tokens: u.input_tokens,
                 completion_tokens: u.output_tokens,
@@ -1288,10 +1287,7 @@ impl LlmResponseCodec for OpenAIResponsesCodec {
                     .input_tokens
                     .zip(cache_read_tokens)
                     .and_then(|(total, cached)| total.checked_sub(cached)),
-                cost: provider_reported_cost(
-                    u.provider_cost.or(scalar_provider_cost),
-                    detailed_cost,
-                ),
+                cost: provider_reported_cost(u.provider_cost, u.cost),
             };
             if usage.cost.is_none() {
                 usage.cost = model_for_pricing.and_then(|model| {

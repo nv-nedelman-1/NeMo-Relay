@@ -20,8 +20,8 @@ use super::request::{
 };
 use super::resolve::{ProviderSurface, ProviderSurfaceDescriptor};
 use super::response::{
-    AnnotatedLlmResponse, ApiSpecificResponse, FinishReason, RawProviderCost, ResponseToolCall,
-    Usage, estimate_cost_for_provider, infer_model_provider, provider_reported_cost,
+    AnnotatedLlmResponse, ApiSpecificResponse, FinishReason, RawUsageCost, ResponseToolCall, Usage,
+    estimate_cost_for_provider, infer_model_provider, provider_reported_cost,
 };
 use super::traits::{LlmCodec, LlmResponseCodec};
 
@@ -93,7 +93,14 @@ struct RawChatUsage {
     prompt_tokens_details: Option<RawPromptTokensDetails>,
     #[serde(rename = "cost_usd")]
     provider_cost: Option<f64>,
-    cost: Option<RawProviderCost>,
+    cost: Option<RawChatUsageCost>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawChatUsageCost {
+    Scalar(f64),
+    Detailed(RawUsageCost),
 }
 
 #[derive(Deserialize)]
@@ -1174,7 +1181,11 @@ impl LlmResponseCodec for OpenAIChatCodec {
                 .prompt_tokens_details
                 .as_ref()
                 .and_then(|details| details.cached_tokens);
-            let (scalar_provider_cost, detailed_cost) = RawProviderCost::split(u.cost);
+            let (scalar_provider_cost, detailed_cost) = match u.cost {
+                Some(RawChatUsageCost::Scalar(cost)) => (Some(cost), None),
+                Some(RawChatUsageCost::Detailed(cost)) => (None, Some(cost)),
+                None => (None, None),
+            };
             let mut usage = Usage {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
