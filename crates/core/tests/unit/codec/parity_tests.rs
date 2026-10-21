@@ -514,6 +514,39 @@ fn test_provider_reported_scalar_cost_parity() {
 }
 
 #[test]
+fn test_provider_reported_scalar_total_cost_parity() {
+    // OpenRouter and LiteLLM-style gateways report `cost` as a USD total rather
+    // than a cost object; every schema must accept it instead of failing decode.
+    let cost = json!({"cost": 0.25});
+    let decoded = [
+        decode(&chat_response_with_usage(
+            "parity-reported-model",
+            cost.clone(),
+        )),
+        decode(&anthropic_response_with_usage(
+            "parity-reported-model",
+            cost.clone(),
+        )),
+        decode(&responses_response_with_usage(
+            "parity-reported-model",
+            cost,
+        )),
+    ];
+    for response in decoded {
+        let cost = response
+            .usage
+            .unwrap()
+            .cost
+            .expect("scalar total reported cost");
+        assert_eq!(cost.total, Some(0.25));
+        assert_eq!(cost.currency, "USD");
+        assert_eq!(cost.source, CostSource::ProviderReported);
+        assert_eq!(cost.input, None);
+        assert_eq!(cost.output, None);
+    }
+}
+
+#[test]
 fn test_estimated_cost_parity_for_identical_model_and_usage() {
     let _pricing_guard = pricing_test_mutex()
         .lock()

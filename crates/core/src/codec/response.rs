@@ -42,6 +42,28 @@ pub(crate) struct RawUsageCost {
     pub pricing_source: Option<String>,
 }
 
+/// Provider-reported usage cost: a USD total, as OpenRouter and LiteLLM-style gateways report it,
+/// or a cost object.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum RawProviderCost {
+    /// Total cost in USD.
+    Scalar(f64),
+    /// Cost object with optional components and provenance.
+    Detailed(RawUsageCost),
+}
+
+impl RawProviderCost {
+    /// Splits a reported cost into its scalar USD total and its cost object.
+    pub(crate) fn split(cost: Option<Self>) -> (Option<f64>, Option<RawUsageCost>) {
+        match cost {
+            Some(Self::Scalar(total)) => (Some(total), None),
+            Some(Self::Detailed(cost)) => (None, Some(cost)),
+            None => (None, None),
+        }
+    }
+}
+
 pub(crate) fn provider_reported_cost(
     provider_total_cost: Option<f64>,
     cost: Option<RawUsageCost>,

@@ -587,6 +587,23 @@ fn observation_content_value(value: &Json) -> Option<Json> {
     }
 }
 
+/// A failed tool call usually ends without output, but the agent still observed the failure, so its
+/// description becomes the observation content.
+fn tool_failure_description(event: &Event) -> Option<String> {
+    let metadata = event.metadata()?;
+    if metadata.get("otel.status_code").and_then(Json::as_str) != Some("ERROR") {
+        return None;
+    }
+    Some(
+        metadata
+            .get("otel.status_description")
+            .and_then(Json::as_str)
+            .filter(|description| !description.is_empty())
+            .unwrap_or("tool call failed")
+            .to_string(),
+    )
+}
+
 fn observation_extra(event: &Event, output: Option<&Json>, content: Option<&Json>) -> Json {
     let mut extra = event_extra(event);
     if let Json::Object(extra_object) = &mut extra {
@@ -2825,11 +2842,14 @@ impl StepConversionState {
     fn handle_tool_end(&mut self, event: &Event, lookups: &EventLookupMaps) {
         let source_call_id = self.resolve_source_call_id(event, lookups);
         let output = event.data();
-        if output.is_some() || super::tool_result_annotation(event).is_some() {
+        let failure = tool_failure_description(event);
+        if output.is_some() || super::tool_result_annotation(event).is_some() || failure.is_some() {
             if self.pending_obs_timestamp.is_none() {
                 self.pending_obs_timestamp = Some(event.timestamp().to_rfc3339());
             }
-            let content = output.and_then(observation_content_value);
+            let content = output
+                .and_then(observation_content_value)
+                .or_else(|| failure.map(Json::String));
             self.pending_observations.push(AtifObservationResult {
                 source_call_id: source_call_id.clone(),
                 extra: Some(observation_extra(event, output, content.as_ref())),
