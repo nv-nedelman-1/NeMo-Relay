@@ -443,6 +443,7 @@ fn native_context_gate_registration_validates_inputs_and_rolls_back_the_gate() {
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
         _library: libloading::os::unix::Library::this().into(),
+        _artifact_snapshot: None,
     });
     let mut registration = PluginRegistrationContext::with_namespace("fixture:");
     let mut host = NativeHostPluginContext {
@@ -1005,6 +1006,7 @@ fn native_test_adapter(
             allows_multiple_components: false,
             plugin: Mutex::new(plugin),
             _library: libloading::os::unix::Library::this().into(),
+            _artifact_snapshot: None,
         }),
     }
 }
@@ -1140,6 +1142,11 @@ fn assert_native_host_api_versions() {
     assert_native_host_api_descriptor(
         current,
         NEMO_RELAY_NATIVE_ABI_VERSION,
+        std::mem::size_of::<NemoRelayNativeHostApiV8>(),
+    );
+    assert_native_host_api_descriptor(
+        native_host_api_v7(),
+        NEMO_RELAY_NATIVE_ABI_VERSION_LLM_EXECUTION_CONTEXT,
         std::mem::size_of::<NemoRelayNativeHostApiV7>(),
     );
     assert_native_host_api_descriptor(
@@ -2384,7 +2391,7 @@ fn assert_native_json_output_and_host_api() {
     assert_eq!(host_api.abi_version, NEMO_RELAY_NATIVE_ABI_VERSION);
     assert_eq!(
         host_api.struct_size,
-        std::mem::size_of::<NemoRelayNativeHostApiV7>()
+        std::mem::size_of::<NemoRelayNativeHostApiV8>()
     );
 }
 
@@ -5743,6 +5750,7 @@ fn native_registration_entrypoints_reject_invalid_host_contexts_and_names() {
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
         _library: libloading::os::unix::Library::this().into(),
+        _artifact_snapshot: None,
     });
     let mut invalid_host = NativeHostPluginContext {
         ctx: ptr::null_mut(),
@@ -5772,6 +5780,22 @@ fn native_registration_entrypoints_reject_invalid_host_contexts_and_names() {
     assert_registration_entrypoints_accept_valid_names(ctx);
     assert_async_registration_entrypoints_validate_contracts(ctx);
     assert_context_registrations_reject_legacy_relay_contracts();
+
+    let cleanup = crate::plugin::rollback_registrations(&mut registration.into_registrations());
+    let errors = cleanup.errors();
+    assert!(errors.is_empty(), "{errors:?}");
+    let leftovers = crate::api::registry::list_runtime_registrations(None)
+        .unwrap()
+        .into_iter()
+        .map(|identity| identity.effective_name)
+        .filter(|name| {
+            matches!(
+                name.as_str(),
+                "registered" | "async-registered" | "async-stream-registered"
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }
 
 #[cfg(unix)]
@@ -6148,7 +6172,7 @@ fn assert_async_registration_entrypoints_validate_contracts(
                 name,
                 0,
                 false,
-                resolve_async_static_json,
+                resolve_async_null_json,
                 ptr::null_mut(),
                 None,
             ),
@@ -6179,6 +6203,7 @@ fn assert_context_registrations_reject_legacy_relay_contracts() {
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
         _library: libloading::os::unix::Library::this().into(),
+        _artifact_snapshot: None,
     });
     let mut registration = PluginRegistrationContext::new();
     let mut host = NativeHostPluginContext {
@@ -6209,6 +6234,7 @@ fn assert_context_registrations_reject_legacy_relay_contracts() {
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
         _library: libloading::os::unix::Library::this().into(),
+        _artifact_snapshot: None,
     });
     let mut context_registration = PluginRegistrationContext::new();
     let mut context_host = NativeHostPluginContext {
@@ -6245,6 +6271,19 @@ unsafe extern "C" fn resolve_async_static_json(
         unsafe { native_async_completion_resolve_json(completion, user_data.cast()) },
         NemoRelayStatus::Ok
     );
+    NemoRelayNativeAsyncCallbackState::Complete as u32
+}
+
+#[cfg(unix)]
+unsafe extern "C" fn resolve_async_null_json(
+    _user_data: *mut c_void,
+    _invocation_json: *const NemoRelayNativeString,
+    _next: *const NemoRelayNativeAsyncNext,
+    completion: *const NemoRelayNativeAsyncCompletion,
+) -> u32 {
+    let document = native_string("null");
+    let _ = unsafe { native_async_completion_resolve_json(completion, document) };
+    unsafe { native_string_free(document) };
     NemoRelayNativeAsyncCallbackState::Complete as u32
 }
 
@@ -6654,6 +6693,7 @@ async fn native_async_wrappers_validate_callback_result_shapes() {
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
         _library: libloading::os::unix::Library::this().into(),
+        _artifact_snapshot: None,
     });
     let result = native_string("true");
     let user_data = result.cast();
@@ -7600,6 +7640,7 @@ async fn native_callback_wrappers_release_error_outputs_and_preserve_reasons() {
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
         _library: libloading::os::unix::Library::this().into(),
+        _artifact_snapshot: None,
     });
     let request = LlmRequest {
         headers: Map::new(),
@@ -7732,6 +7773,7 @@ async fn native_tool_execution_context_preserves_fields_and_callback_boundaries(
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
         _library: libloading::os::unix::Library::this().into(),
+        _artifact_snapshot: None,
     });
     let observed_context = Mutex::new(None);
     let context = ToolExecutionContext::new("lookup", json!({"query": "private"}))
@@ -8754,6 +8796,7 @@ async fn native_llm_intercept_preserves_annotations_and_releases_invalid_output_
         allows_multiple_components: false,
         plugin: Mutex::new(NemoRelayNativePluginV1::default()),
         _library: libloading::os::unix::Library::this().into(),
+        _artifact_snapshot: None,
     });
     let callback =
         wrap_llm_request_intercept_fn(instance, echo_native_llm_intercept, ptr::null_mut(), None);
@@ -8783,4 +8826,232 @@ async fn native_llm_intercept_preserves_annotations_and_releases_invalid_output_
         assert!(error.to_string().contains(reason), "{error}");
         assert_eq!(native_string_live_allocations(), before);
     }
+}
+
+#[test]
+fn native_snapshot_keeps_verified_bytes_private_until_drop() {
+    let source = tempfile::tempdir().unwrap();
+    let library = source.path().join("plugin.bin");
+    let bytes = b"verified native plugin bytes";
+    let manifest = DynamicPluginManifest::parse_toml(&format!(
+        r#"
+manifest_version = 1
+[plugin]
+id = "fixture.snapshot"
+kind = "rust_dynamic"
+[compat]
+relay = ">=0.10.0,<1.0"
+native_api = "1"
+[defaults]
+enabled = false
+[capabilities]
+items = ["plugin_native"]
+[source]
+artifact = "plugin.bin"
+[integrity]
+sha256 = "sha256:{digest}"
+[load]
+library = "plugin.bin"
+symbol = "unused"
+"#,
+        digest = hex_digest(Sha256::digest(bytes))
+    ))
+    .unwrap();
+    std::fs::write(&library, b"replacement source bytes").unwrap();
+    let (staged, snapshot) =
+        prepare_native_library(&manifest, library, Some(bytes.to_vec()), true).unwrap();
+    let snapshot = snapshot.unwrap();
+    assert_eq!(std::fs::read(&staged).unwrap(), bytes);
+    assert!(!staged.starts_with(source.path()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            snapshot.path().metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    let root = snapshot.path().to_owned();
+    drop(snapshot);
+    assert!(!root.exists());
+}
+
+#[test]
+fn native_host_load_rejects_replacement_artifact_using_retained_trust() {
+    use crate::plugin::dynamic::{
+        DynamicPluginAttestationMode, DynamicPluginHostPolicy, evaluate_dynamic_plugin_host_policy,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let library = temp.path().join("library.so");
+    let bytes = b"verified library fixture";
+    std::fs::write(&library, bytes).unwrap();
+    let digest = hex_digest(Sha256::digest(bytes));
+    let manifest_path = temp.path().join("relay-plugin.toml");
+    let original = format!(
+        r#"
+manifest_version = 1
+[plugin]
+id = "fixture.retained-trust"
+kind = "rust_dynamic"
+[compat]
+relay = ">=0.8.0,<1.0"
+native_api = "1"
+[defaults]
+enabled = false
+[capabilities]
+items = ["plugin_native"]
+[source]
+artifact = "library.so"
+[integrity]
+sha256 = "sha256:{digest}"
+[load]
+library = "library.so"
+symbol = "never_call"
+"#
+    );
+    std::fs::write(&manifest_path, &original).unwrap();
+    let manifest = DynamicPluginManifest::parse_toml(&original).unwrap();
+    let mut policy = DynamicPluginHostPolicy::default();
+    policy.defaults.attestation = Some(DynamicPluginAttestationMode::IntegrityOnly);
+    policy.defaults.startup = Some(crate::plugin::dynamic::DynamicPluginStartupClass::Required);
+    let context = DynamicPluginLoadTrust {
+        policy: evaluate_dynamic_plugin_host_policy(&policy, &manifest),
+        manifest,
+    };
+    let manifest_ref = manifest_path.to_str().unwrap().to_owned();
+    assert!(
+        context
+            .manifest_for_load(&manifest_ref, &mut Vec::new())
+            .is_ok()
+    );
+
+    // The replacement removes integrity metadata and points at modified code.
+    std::fs::write(&library, b"modified library fixture").unwrap();
+    std::fs::write(
+        &manifest_path,
+        original.replace(&format!("[integrity]\nsha256 = \"sha256:{digest}\"\n"), ""),
+    )
+    .unwrap();
+    let mut trust =
+        std::collections::HashMap::from([("fixture.retained-trust".to_owned(), context)]);
+    let error = match load_native_plugins_with_trust(
+        [NativePluginLoadSpec {
+            plugin_id: "fixture.retained-trust".into(),
+            manifest_ref: manifest_ref.clone(),
+        }],
+        &trust,
+        &mut Vec::new(),
+        Vec::new(),
+    ) {
+        Ok(_) => panic!("replacement artifact must be rejected before loading native code"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("failed integrity verification"));
+    trust
+        .get_mut("fixture.retained-trust")
+        .unwrap()
+        .policy
+        .startup_class = crate::plugin::dynamic::DynamicPluginStartupClass::Optional;
+    let mut skipped = Vec::new();
+    let activation = load_native_plugins_with_trust(
+        [NativePluginLoadSpec {
+            plugin_id: "fixture.retained-trust".into(),
+            manifest_ref,
+        }],
+        &trust,
+        &mut skipped,
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(activation.is_empty());
+    assert_eq!(skipped.len(), 1);
+    assert!(!skipped[0].selected);
+    assert_eq!(
+        skipped[0].failure.as_ref().unwrap().code,
+        "integrity_failed"
+    );
+}
+
+#[test]
+fn native_http_error_prefix_preserves_status_through_continuations() {
+    for status in 400..=599 {
+        let original = FlowError::Upstream(crate::error::UpstreamFailure {
+            status: Some(status),
+            body: "provider failure".into(),
+            headers: Default::default(),
+            class: crate::error::UpstreamFailureClass::RetryableStatus,
+        });
+        let native_status = status_from_flow_error(original);
+        assert_eq!(native_status, NemoRelayStatus::Internal);
+        let returned = flow_error_from_status(native_status, "fallback");
+        let FlowError::Upstream(failure) = returned else {
+            panic!("status was lost");
+        };
+        assert_eq!(failure.status, Some(status));
+        assert_eq!(failure.body, "provider failure");
+        assert!(!failure.is_retryable());
+    }
+    set_native_last_error("wrapped: HTTP 403: denied");
+    assert!(matches!(
+        flow_error_from_status(NemoRelayStatus::Internal, "fallback"),
+        FlowError::Internal(_)
+    ));
+    set_native_last_error("HTTP 403: denied");
+    assert!(matches!(
+        flow_error_from_status(NemoRelayStatus::GuardrailRejected, "fallback"),
+        FlowError::GuardrailRejected(_)
+    ));
+    clear_native_last_error();
+}
+
+#[tokio::test]
+async fn native_async_http_error_rejection_preserves_status() {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let completion = Arc::new(NativeAsyncCompletion {
+        sender: Mutex::new(Some(sender)),
+        cancelled: AtomicBool::new(false),
+        next_invoked: AtomicBool::new(false),
+        next_abort: Mutex::new(None),
+        continuation_aborts: Mutex::new(HashMap::new()),
+        request_codec: None,
+        response_codec: None,
+        before_settlement_lock: None,
+        _callback_user_data: None,
+    });
+    let message = native_string("HTTP 404: missing model");
+    assert_eq!(
+        unsafe { native_async_completion_reject(Arc::as_ptr(&completion).cast(), message) },
+        NemoRelayStatus::Ok
+    );
+    unsafe { native_string_free(message) };
+    let error = receiver.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, FlowError::Upstream(failure) if failure.status == Some(404) && failure.body == "missing model" && !failure.is_retryable())
+    );
+}
+
+#[tokio::test]
+async fn native_async_stream_http_error_rejection_preserves_status() {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let stream = Arc::new(NativeAsyncStream {
+        sender: Mutex::new(Some(sender)),
+        cancelled: AtomicBool::new(false),
+        settled: AtomicBool::new(false),
+        backpressured: AtomicBool::new(false),
+        downstream_aborts: Mutex::new(HashMap::new()),
+        settlement: Mutex::new(()),
+        request_codec: None,
+        before_settlement_lock: None,
+        _callback_user_data: None,
+    });
+    let message = native_string("HTTP 503: unavailable");
+    assert_eq!(
+        unsafe { native_async_stream_reject(Arc::as_ptr(&stream).cast(), message) },
+        NemoRelayStatus::Ok
+    );
+    unsafe { native_string_free(message) };
+    let error = receiver.recv().await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, FlowError::Upstream(failure) if failure.status == Some(503) && !failure.is_retryable())
+    );
 }

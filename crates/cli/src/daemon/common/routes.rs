@@ -25,6 +25,14 @@ pub(crate) enum ProviderRoute {
 }
 
 impl PublicRoute {
+    pub(crate) fn from_request(path: &str, headers: &axum::http::HeaderMap) -> Option<Self> {
+        if crate::gateway::is_anthropic_models_request(path, headers) {
+            Some(Self::Provider(ProviderRoute::Anthropic))
+        } else {
+            Self::from_path(path)
+        }
+    }
+
     pub(crate) fn from_path(path: &str) -> Option<Self> {
         match path {
             "/hooks/codex" => Some(Self::Hook(HookRoute::Codex)),
@@ -36,10 +44,31 @@ impl PublicRoute {
             | "/v1/responses"
             | "/backend-api/codex/responses"
             | "/v1/chat/completions"
+            | "/responses/compact"
+            | "/v1/responses/compact"
+            | "/backend-api/codex/responses/compact"
+            | "/realtime/calls"
+            | "/v1/realtime/calls"
+            | "/backend-api/codex/realtime/calls"
+            | "/realtime"
+            | "/v1/realtime"
+            | "/live"
+            | "/v1/live"
+            | "/live/sessions"
+            | "/v1/live/sessions"
             | "/v1/images/generations"
+            | "/images/edits"
+            | "/v1/images/edits"
+            | "/memories/trace_summarize"
+            | "/v1/memories/trace_summarize"
+            | "/alpha/search"
+            | "/v1/alpha/search"
             | "/v1/models" => Some(Self::Provider(ProviderRoute::OpenAi)),
             "/v1/messages" | "/v1/messages/count_tokens" => {
                 Some(Self::Provider(ProviderRoute::Anthropic))
+            }
+            path if crate::gateway::websocket::live_sideband_path(path) => {
+                Some(Self::Provider(ProviderRoute::OpenAi))
             }
             _ => None,
         }

@@ -45,7 +45,7 @@ pub use nemo_relay_types::api::registry::{
     RuntimeRegistrationIdentity, RuntimeRegistrationKind, RuntimeRegistrationOwner,
     RuntimeRegistrationOwnerKind,
 };
-pub use nemo_relay_types::api::scope::ScopeType;
+pub use nemo_relay_types::api::scope::{ScopeStackEntry, ScopeStackSnapshot, ScopeType};
 pub use nemo_relay_types::api::tool::{ToolExecutionInterceptOutcome, ToolExecutionResult};
 pub use nemo_relay_types::codec::identity::{BuiltinLlmCodec, LlmCodecIdentity};
 pub use nemo_relay_types::codec::optimization::{
@@ -56,6 +56,7 @@ pub use nemo_relay_types::codec::optimization::{
 };
 pub use nemo_relay_types::codec::request::{ANNOTATED_LLM_REQUEST_SCHEMA, AnnotatedLlmRequest};
 pub use nemo_relay_types::codec::response::AnnotatedLlmResponse;
+pub use nemo_relay_types::plugin::http_error_message;
 pub use nemo_relay_types::plugin::{ConfigDiagnostic, DiagnosticLevel};
 use nemo_relay_worker_proto::v1::plugin_worker_server::{PluginWorker, PluginWorkerServer};
 use nemo_relay_worker_proto::v1::relay_host_runtime_client::RelayHostRuntimeClient;
@@ -1351,6 +1352,59 @@ impl PluginRuntime {
             .map_err(|err| WorkerSdkError::Transport(err.to_string()))?
             .into_inner();
         ack_to_result(response.ok, response.error)
+    }
+
+    /// Read owned root-to-top scope identities from the exact current binding.
+    /// Returns None without a binding, and an explicit error on older hosts or
+    /// invalid/expired bindings. Never caches an invocation-entry snapshot.
+    pub async fn current_scope_stack_snapshot(&self) -> Result<Option<ScopeStackSnapshot>> {
+        let scope = self.current_scope_context();
+        let mut client = self.host_client().await?;
+        let response = client
+            .get_current_scope_stack_snapshot(Request::new(
+                nemo_relay_worker_proto::v1::GetCurrentScopeStackSnapshotRequest {
+                    activation_id: self.activation_id.clone(),
+                    auth_token: self.auth_token.clone(),
+                    scope,
+                },
+            ))
+            .await
+            .map_err(|error| {
+                if error.code() == tonic::Code::Unimplemented {
+                    WorkerSdkError::Callback(
+                        "scope stack snapshots are unsupported by this host; \
+                         require the grpc-v1 snapshot extension"
+                            .into(),
+                    )
+                } else {
+                    WorkerSdkError::Transport(error.to_string())
+                }
+            })?
+            .into_inner();
+        if let Some(error) = response.error {
+            return Err(worker_error_to_sdk(error));
+        }
+        response
+            .snapshot
+            .map(|snapshot| {
+                let scopes = snapshot
+                    .scopes
+                    .into_iter()
+                    .map(|scope| {
+                        let scope_id = scope.scope_id.parse().map_err(|error| {
+                            WorkerSdkError::InvalidInput(format!(
+                                "invalid snapshot scope UUID: {error}"
+                            ))
+                        })?;
+                        Ok(ScopeStackEntry {
+                            scope_id,
+                            scope_type: snapshot_scope_type_from_proto(scope.scope_type),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(ScopeStackSnapshot { scopes })
+            })
+            .transpose()
     }
 
     /// Return a bounded snapshot of active host runtime diagnostics.
@@ -3356,7 +3410,14 @@ fn infallible_json_envelope<T: serde::Serialize>(schema: &str, value: &T) -> Jso
 fn sdk_error_to_worker(error: WorkerSdkError) -> WorkerError {
     WorkerError {
         code: "worker.error".into(),
-        message: error.to_string(),
+        message: match &error {
+            WorkerSdkError::Callback(message)
+                if nemo_relay_types::plugin::parse_http_error_message(message).is_some() =>
+            {
+                message.clone()
+            }
+            _ => error.to_string(),
+        },
         retryable: false,
     }
 }
@@ -3433,7 +3494,13 @@ fn cancellation_aware_worker_stream(
 }
 
 fn worker_error_to_sdk(error: WorkerError) -> WorkerSdkError {
-    WorkerSdkError::Callback(format!("{}: {}", error.code, error.message))
+    if error.code != "worker.cancelled"
+        && nemo_relay_types::plugin::parse_http_error_message(&error.message).is_some()
+    {
+        WorkerSdkError::Callback(error.message)
+    } else {
+        WorkerSdkError::Callback(format!("{}: {}", error.code, error.message))
+    }
 }
 
 fn status_from_sdk(error: WorkerSdkError) -> Status {
@@ -3619,6 +3686,23 @@ fn runtime_registration_kind(surface: RegistrationSurface) -> Result<RuntimeRegi
                 "surface is not a runtime registration kind".into(),
             ))
         }
+    }
+}
+
+fn snapshot_scope_type_from_proto(scope_type: i32) -> ScopeType {
+    use nemo_relay_worker_proto::v1::ScopeType as ProtoScopeType;
+    match ProtoScopeType::try_from(scope_type) {
+        Ok(ProtoScopeType::Agent) => ScopeType::Agent,
+        Ok(ProtoScopeType::Function) => ScopeType::Function,
+        Ok(ProtoScopeType::Tool) => ScopeType::Tool,
+        Ok(ProtoScopeType::Llm) => ScopeType::Llm,
+        Ok(ProtoScopeType::Retriever) => ScopeType::Retriever,
+        Ok(ProtoScopeType::Embedder) => ScopeType::Embedder,
+        Ok(ProtoScopeType::Reranker) => ScopeType::Reranker,
+        Ok(ProtoScopeType::Guardrail) => ScopeType::Guardrail,
+        Ok(ProtoScopeType::Evaluator) => ScopeType::Evaluator,
+        Ok(ProtoScopeType::Custom) => ScopeType::Custom,
+        _ => ScopeType::Unknown,
     }
 }
 

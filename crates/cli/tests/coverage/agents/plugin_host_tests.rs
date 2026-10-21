@@ -268,7 +268,6 @@ fn generated_codex_hook_metadata(
         "user_prompt_submit",
         "pre_tool_use",
         "post_tool_use",
-        "permission_request",
         "subagent_start",
         "subagent_stop",
         "stop",
@@ -639,7 +638,7 @@ fn codex_auto_trusts_only_exact_generated_plugin_hooks_and_verifies_them() {
     assert_eq!(
         client.trusted,
         vec![
-            (0..10)
+            (0..9)
                 .map(|index| format!("relay-hook-{index}"))
                 .collect::<Vec<_>>()
         ]
@@ -714,7 +713,6 @@ fn every_generated_codex_hook_is_required_exactly_once_and_trusted() {
         ("user_prompt_submit", "UserPromptSubmit"),
         ("pre_tool_use", "PreToolUse"),
         ("post_tool_use", "PostToolUse"),
-        ("permission_request", "PermissionRequest"),
         ("subagent_start", "SubagentStart"),
         ("subagent_stop", "SubagentStop"),
         ("stop", "Stop"),
@@ -798,7 +796,6 @@ fn codex_auto_trust_reverifies_every_generated_hook_after_writing() {
         "user_prompt_submit",
         "pre_tool_use",
         "post_tool_use",
-        "permission_request",
         "subagent_start",
         "subagent_stop",
         "stop",
@@ -850,7 +847,7 @@ fn codex_auto_trust_reverifies_every_generated_hook_after_writing() {
                 "{event} {condition}: {error}"
             );
             assert_eq!(client.restored.len(), 1, "{event} {condition}");
-            assert_eq!(client.restored[0].len(), 10, "{event} {condition}");
+            assert_eq!(client.restored[0].len(), 9, "{event} {condition}");
         }
     }
 }
@@ -883,7 +880,7 @@ fn codex_auto_trust_rejects_targeted_hook_that_disappears_after_write() {
     .unwrap_err();
 
     assert!(
-        error.contains("unverified targeted hooks=relay-hook-9"),
+        error.contains("unverified targeted hooks=relay-hook-8"),
         "{error}"
     );
     assert_eq!(client.restored.len(), 1);
@@ -918,7 +915,7 @@ fn codex_auto_trust_rejects_targeted_hook_that_changes_key_after_write() {
     .unwrap_err();
 
     assert!(
-        error.contains("unverified targeted hooks=relay-hook-9"),
+        error.contains("unverified targeted hooks=relay-hook-8"),
         "{error}"
     );
     assert_eq!(client.restored.len(), 1);
@@ -943,7 +940,7 @@ custom = "preserve"
     .unwrap();
     let initial = generated_codex_hook_metadata(dir.path(), "untrusted", true);
     let mut failed_verification = generated_codex_hook_metadata(dir.path(), "trusted", true);
-    failed_verification[9].enabled = false;
+    failed_verification[8].enabled = false;
     let mut client = FakeCodexHooksClient {
         hook_lists: VecDeque::from([Ok(initial.clone()), Ok(failed_verification), Ok(initial)]),
         ..FakeCodexHooksClient::default()
@@ -959,7 +956,7 @@ custom = "preserve"
 
     assert!(error.contains("did not enable and trust"), "{error}");
     assert_eq!(client.restored.len(), 1);
-    assert_eq!(client.restored[0].len(), 10);
+    assert_eq!(client.restored[0].len(), 9);
     assert_eq!(
         client.restored[0]
             .iter()
@@ -1033,7 +1030,7 @@ fn codex_auto_trust_does_not_depend_on_reported_plugin_source_path() {
     )
     .unwrap();
 
-    assert_eq!(client.trusted[0].len(), 10);
+    assert_eq!(client.trusted[0].len(), 9);
 }
 
 #[test]
@@ -1120,7 +1117,6 @@ fn codex_hook_trust_report_distinguishes_modified_disabled_and_missing_hooks() {
         json!([
             "PreToolUse",
             "PostToolUse",
-            "PermissionRequest",
             "SubagentStart",
             "SubagentStop",
             "Stop",
@@ -2655,7 +2651,7 @@ fn codex_doctor_requires_app_server_reported_trust_but_allows_stopped_sidecar() 
     assert_eq!(
         report["codex_hook_trust"]["trusted"],
         json!(
-            (0..10)
+            (0..9)
                 .map(|index| format!("relay-hook-{index}"))
                 .collect::<Vec<_>>()
         )
@@ -2837,7 +2833,7 @@ fn codex_uninstall_clears_all_trust_for_the_exact_relay_plugin() {
     assert_eq!(
         client.cleared,
         vec![
-            (0..10)
+            (0..9)
                 .map(|index| format!("relay-hook-{index}"))
                 .chain(["unrelated-hook".into()])
                 .collect::<Vec<_>>()
@@ -5010,4 +5006,252 @@ enabled = false
         Some("preserve-me")
     );
     assert!(codex_provider_header(&doc, BOOTSTRAP_CLIENT_TOKEN_HEADER).is_some());
+}
+
+#[test]
+fn codex_chatgpt_voice_install_sets_backend_call_url_and_uninstall_restores_config() {
+    for (auth, expected) in [
+        (json!({"auth_mode":"chatgpt", "tokens":{}}), true),
+        (json!({"tokens":{}, "OPENAI_API_KEY":null}), true),
+        (
+            json!({"auth_mode":"apikey", "OPENAI_API_KEY":"test-key"}),
+            false,
+        ),
+        (json!({"auth_mode":"apikey", "tokens":{}}), false),
+        (json!({}), false),
+    ] {
+        let dir = tempdir().unwrap();
+        let _home = HomeScope::enter(dir.path());
+        let path = dir.path().join(".codex/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path.parent().unwrap().join("auth.json"),
+            serde_json::to_vec(&auth).unwrap(),
+        )
+        .unwrap();
+        fs::write(&path, "model = \"test-model\"\n").unwrap();
+        for _ in 0..2 {
+            install_codex_config(&path, DEFAULT_URL).unwrap();
+            let doc = fs::read_to_string(&path)
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap();
+            assert_eq!(
+                doc.get("experimental_realtime_webrtc_call_base_url")
+                    .and_then(Item::as_str),
+                expected.then_some("http://127.0.0.1:47632/backend-api/codex"),
+                "{auth:?}"
+            );
+            assert_eq!(
+                doc["openai_base_url"].as_str(),
+                Some("http://127.0.0.1:47632/v1")
+            );
+        }
+        uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+        let doc = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(!doc.contains_key("experimental_realtime_webrtc_call_base_url"));
+        assert_eq!(doc["model"].as_str(), Some("test-model"));
+    }
+}
+
+#[test]
+fn codex_chatgpt_voice_install_preserves_explicit_and_edited_call_urls() {
+    for explicit in [false, true] {
+        let dir = tempdir().unwrap();
+        let _home = HomeScope::enter(dir.path());
+        let path = dir.path().join(".codex/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path.parent().unwrap().join("auth.json"),
+            r#"{"auth_mode":"chatgpt"}"#,
+        )
+        .unwrap();
+        fs::write(&path, if explicit { "experimental_realtime_webrtc_call_base_url = \"https://voice.example/backend-api/codex\"\n" } else { "model = \"test-model\"\n" }).unwrap();
+        install_codex_config(&path, DEFAULT_URL).unwrap();
+        let mut doc = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        if !explicit {
+            doc["experimental_realtime_webrtc_call_base_url"] =
+                toml_edit::value("https://voice.example/backend-api/codex");
+            fs::write(&path, doc.to_string()).unwrap();
+        }
+        install_codex_config(&path, DEFAULT_URL).unwrap();
+        uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+        let doc = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            doc["experimental_realtime_webrtc_call_base_url"].as_str(),
+            Some("https://voice.example/backend-api/codex")
+        );
+    }
+}
+
+#[test]
+fn codex_chatgpt_voice_reinstall_tracks_auth_changes_and_forced_login() {
+    let dir = tempdir().unwrap();
+    let _home = HomeScope::enter(dir.path());
+    let path = dir.path().join(".codex/config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "model = \"test-model\"\n").unwrap();
+    let auth_path = path.parent().unwrap().join("auth.json");
+    fs::write(&auth_path, r#"{"auth_mode":"chatgpt"}"#).unwrap();
+    install_codex_config(&path, DEFAULT_URL).unwrap();
+    fs::write(
+        &auth_path,
+        r#"{"auth_mode":"apikey","OPENAI_API_KEY":"test-key"}"#,
+    )
+    .unwrap();
+    install_codex_config(&path, DEFAULT_URL).unwrap();
+    let mut doc = fs::read_to_string(&path)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert!(!doc.contains_key("experimental_realtime_webrtc_call_base_url"));
+    doc["forced_login_method"] = toml_edit::value("chatgpt");
+    fs::write(&path, doc.to_string()).unwrap();
+    fs::remove_file(auth_path).unwrap();
+    install_codex_config(&path, DEFAULT_URL).unwrap();
+    let doc = fs::read_to_string(&path)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        doc["experimental_realtime_webrtc_call_base_url"].as_str(),
+        Some("http://127.0.0.1:47632/backend-api/codex")
+    );
+    uninstall_codex_config(&path, DEFAULT_URL, false).unwrap();
+    let doc = fs::read_to_string(&path)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert!(!doc.contains_key("experimental_realtime_webrtc_call_base_url"));
+    assert_eq!(doc["forced_login_method"].as_str(), Some("chatgpt"));
+}
+
+#[test]
+fn codex_chatgpt_voice_reinstall_moves_generated_url_without_changing_overrides() {
+    for explicit in [false, true] {
+        let dir = tempdir().unwrap();
+        let _home = HomeScope::enter(dir.path());
+        let path = dir.path().join(".codex/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = if explicit {
+            "forced_login_method = \"chatgpt\"\nexperimental_realtime_webrtc_call_base_url = \"https://voice.example/backend-api/codex\"\n"
+        } else {
+            "forced_login_method = \"chatgpt\"\n"
+        };
+        fs::write(&path, original).unwrap();
+        install_codex_config(&path, DEFAULT_URL).unwrap();
+        let next_gateway = "http://127.0.0.1:47999";
+        install_codex_config(&path, next_gateway).unwrap();
+        let doc = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let expected = if explicit {
+            "https://voice.example/backend-api/codex"
+        } else {
+            "http://127.0.0.1:47999/backend-api/codex"
+        };
+        assert_eq!(
+            doc["experimental_realtime_webrtc_call_base_url"].as_str(),
+            Some(expected)
+        );
+        let backup = fs::read_to_string(backup_path(&path))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            backup
+                .get("experimental_realtime_webrtc_call_base_url")
+                .and_then(Item::as_str),
+            explicit.then_some(expected)
+        );
+        uninstall_codex_config(&path, next_gateway, false).unwrap();
+        let restored = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            restored
+                .get("experimental_realtime_webrtc_call_base_url")
+                .and_then(Item::as_str),
+            explicit.then_some(expected)
+        );
+    }
+}
+
+#[test]
+fn transparent_codex_voice_tracks_gateway_and_preserves_explicit_urls() {
+    use crate::agents::codex::host::transparent_realtime_call_url;
+    let dir = tempdir().unwrap();
+    let _home = HomeScope::enter(dir.path());
+    let path = dir.path().join(".codex/config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let temporary_gateway = "http://127.0.0.1:47999";
+    let expected = Some("http://127.0.0.1:47999/backend-api/codex".to_string());
+    fs::write(&path, "forced_login_method = \"chatgpt\"\n").unwrap();
+    let empty = DocumentMut::new();
+    assert_eq!(
+        transparent_realtime_call_url(temporary_gateway, None, &empty).unwrap(),
+        expected
+    );
+    install_codex_config(&path, DEFAULT_URL).unwrap();
+    let saved = fs::read(&path).unwrap();
+    assert_eq!(
+        transparent_realtime_call_url(temporary_gateway, None, &empty).unwrap(),
+        expected
+    );
+    assert_eq!(fs::read(&path).unwrap(), saved);
+    let api = "forced_login_method = \"api\""
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        transparent_realtime_call_url(temporary_gateway, None, &api).unwrap(),
+        Some("http://127.0.0.1:47999/v1".to_string())
+    );
+    let cli = "experimental_realtime_webrtc_call_base_url = \"https://voice.example/custom\""
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        transparent_realtime_call_url(temporary_gateway, None, &cli).unwrap(),
+        None
+    );
+    let mut doc = fs::read_to_string(&path)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    doc["experimental_realtime_webrtc_call_base_url"] =
+        toml_edit::value("https://voice.example/custom");
+    fs::write(&path, doc.to_string()).unwrap();
+    assert_eq!(
+        transparent_realtime_call_url(temporary_gateway, None, &empty).unwrap(),
+        None
+    );
+    fs::write(
+        &path,
+        "forced_login_method = \"api\"\n[profiles.voice]\nforced_login_method = \"chatgpt\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        transparent_realtime_call_url(temporary_gateway, Some("voice"), &empty).unwrap(),
+        expected
+    );
+    fs::write(&path, "forced_login_method = \"chatgpt\"\n[profiles.voice]\nexperimental_realtime_webrtc_call_base_url = \"https://voice.example/custom\"\n").unwrap();
+    assert_eq!(
+        transparent_realtime_call_url(temporary_gateway, Some("voice"), &empty).unwrap(),
+        None
+    );
+    fs::write(&path, "forced_login_method = \"api\"\n").unwrap();
+    assert_eq!(
+        transparent_realtime_call_url(temporary_gateway, None, &empty).unwrap(),
+        None
+    );
 }

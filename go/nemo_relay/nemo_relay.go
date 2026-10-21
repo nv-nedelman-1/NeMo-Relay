@@ -265,6 +265,7 @@ extern int32_t nemo_relay_scope_stack_set_thread(const FfiScopeStack* stack);
 extern int32_t nemo_relay_scope_stack_capture_thread(FfiThreadScopeStackBinding** out);
 extern int32_t nemo_relay_scope_stack_restore_thread(FfiThreadScopeStackBinding* binding);
 extern _Bool nemo_relay_scope_stack_active(void);
+extern int32_t nemo_relay_current_scope_stack_snapshot_json(char** out);
 extern void nemo_relay_scope_stack_free(FfiScopeStack* ptr);
 
 // ATIF exporter
@@ -292,6 +293,7 @@ extern int32_t nemo_relay_otel_subscriber_create_with_projection_options_v2(cons
 extern int32_t nemo_relay_otel_subscriber_create_with_projection_options_v3(const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, uint64_t, const char*, const char*, const char*, const char*, uint64_t, void**);
 extern int32_t nemo_relay_otel_subscriber_create_with_projection_options_v4(const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, uint64_t, const char*, const char*, const char*, const char*, uint64_t, void**);
 extern int32_t nemo_relay_otel_subscriber_create_with_projection_options_v5(const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, uint64_t, const char*, const char*, const char*, const char*, const char*, uint64_t, void**);
+extern int32_t nemo_relay_otel_subscriber_create_with_projection_options_with_tls(const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, uint64_t, const char*, const char*, const char*, const char*, const char*, uint64_t, const char*, void**);
 extern int32_t nemo_relay_otel_subscriber_create_file_sink(const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, uint64_t, void**);
 extern int32_t nemo_relay_otel_subscriber_register(const void*, const char*);
 extern int32_t nemo_relay_otel_subscriber_deregister(const char*);
@@ -301,6 +303,7 @@ extern int32_t nemo_relay_otel_subscriber_shutdown(const void*);
 extern void nemo_relay_otel_subscriber_free(void*);
 extern int32_t nemo_relay_otel_log_subscriber_create(const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, uint64_t, const char*, uint64_t, uint64_t, uint64_t, uint64_t, void**);
 extern int32_t nemo_relay_otel_log_subscriber_create_v2(const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, uint64_t, const char*, uint64_t, uint64_t, uint64_t, uint64_t, void**);
+extern int32_t nemo_relay_otel_log_subscriber_create_with_tls(const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, uint64_t, const char*, uint64_t, uint64_t, uint64_t, uint64_t, const char*, void**);
 extern int32_t nemo_relay_otel_log_subscriber_register(const void*, const char*);
 extern int32_t nemo_relay_otel_log_subscriber_deregister(const char*);
 extern int32_t nemo_relay_otel_log_subscriber_force_flush(const void*);
@@ -309,6 +312,7 @@ extern int32_t nemo_relay_otel_log_subscriber_shutdown(const void*);
 extern void nemo_relay_otel_log_subscriber_free(void*);
 extern int32_t nemo_relay_otel_metric_subscriber_create(const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, uint64_t, uint64_t, const char*, uint64_t, uint64_t, void**);
 extern int32_t nemo_relay_otel_metric_subscriber_create_v2(const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, uint64_t, uint64_t, const char*, uint64_t, uint64_t, void**);
+extern int32_t nemo_relay_otel_metric_subscriber_create_with_tls(const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, const char*, uint64_t, uint64_t, const char*, uint64_t, uint64_t, const char*, void**);
 extern int32_t nemo_relay_otel_metric_subscriber_register(const void*, const char*);
 extern int32_t nemo_relay_otel_metric_subscriber_deregister(const char*);
 extern int32_t nemo_relay_otel_metric_subscriber_force_flush(const void*);
@@ -342,10 +346,12 @@ extern int32_t goLlmRequestInterceptTrampoline(
 import "C"
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"time"
 	"unsafe"
 )
@@ -608,12 +614,13 @@ func ListRuntimeRegistrations(kinds []RuntimeRegistrationKind) ([]RuntimeRegistr
 // ---------------------------------------------------------------------------
 
 type scopeOptions struct {
-	parent     *C.FfiScopeHandle
-	attributes uint32
-	data       *C.char
-	metadata   *C.char
-	input      *C.char
-	timestamp  *C.int64_t
+	parentHandle *ScopeHandle // retains the borrowed native handle through the FFI call
+	parent       *C.FfiScopeHandle
+	attributes   uint32
+	data         *C.char
+	metadata     *C.char
+	input        *C.char
+	timestamp    *C.int64_t
 }
 
 // ScopeOption is a functional option that configures optional parameters for
@@ -629,6 +636,7 @@ func WithParent(parent *ScopeHandle) ScopeOption {
 	return func(o *scopeOptions) {
 		if parent != nil {
 			o.parent = parent.ptr
+			o.parentHandle = parent
 		}
 	}
 }
@@ -743,6 +751,7 @@ func PushScope(name string, scopeType ScopeType, opts ...ScopeOption) (*ScopeHan
 	for _, opt := range opts {
 		opt(o)
 	}
+	defer runtime.KeepAlive(o.parentHandle)
 
 	cName := C.CString(name)
 	defer C.free(unsafe.Pointer(cName))
@@ -774,6 +783,7 @@ func PushScope(name string, scopeType ScopeType, opts ...ScopeOption) (*ScopeHan
 // [WithScopeEndMetadata], and an explicit event timestamp can be supplied with
 // [WithScopeEndTimestamp].
 func PopScope(handle *ScopeHandle, opts ...ScopeEndOption) error {
+	defer runtime.KeepAlive(handle)
 	o := &scopeEndOptions{}
 	for _, opt := range opts {
 		opt(o)
@@ -795,12 +805,13 @@ func PopScope(handle *ScopeHandle, opts ...ScopeEndOption) error {
 // ---------------------------------------------------------------------------
 
 type eventOptions struct {
-	parent     *C.FfiScopeHandle
-	data       *C.char
-	dataSchema *C.char
-	metadata   *C.char
-	severity   LogSeverity
-	timestamp  *C.int64_t
+	parentHandle *ScopeHandle // retains the borrowed native handle through the FFI call
+	parent       *C.FfiScopeHandle
+	data         *C.char
+	dataSchema   *C.char
+	metadata     *C.char
+	severity     LogSeverity
+	timestamp    *C.int64_t
 }
 
 // replaceCString replaces an option-owned C string and frees its prior value.
@@ -842,6 +853,7 @@ func WithEventParent(parent *ScopeHandle) EventOption {
 	return func(o *eventOptions) {
 		if parent != nil {
 			o.parent = parent.ptr
+			o.parentHandle = parent
 		}
 	}
 }
@@ -902,6 +914,7 @@ func EmitEvent(name string, opts ...EventOption) error {
 	for _, opt := range opts {
 		opt(o)
 	}
+	defer runtime.KeepAlive(o.parentHandle)
 	cName := C.CString(name)
 	defer C.free(unsafe.Pointer(cName))
 	if o.data != nil {
@@ -1026,12 +1039,13 @@ func EmitMetric(name string, measurements []MetricMeasurement, opts ...MetricOpt
 // ---------------------------------------------------------------------------
 
 type toolCallOptions struct {
-	parent     *C.FfiScopeHandle
-	attributes uint32
-	data       *C.char
-	metadata   *C.char
-	toolCallID *C.char
-	timestamp  *C.int64_t
+	parentHandle *ScopeHandle // retains the borrowed native handle through the FFI call
+	parent       *C.FfiScopeHandle
+	attributes   uint32
+	data         *C.char
+	metadata     *C.char
+	toolCallID   *C.char
+	timestamp    *C.int64_t
 }
 
 // ToolCallOption is a functional option that configures optional parameters for
@@ -1049,6 +1063,7 @@ func WithToolParent(parent *ScopeHandle) ToolCallOption {
 	return func(o *toolCallOptions) {
 		if parent != nil {
 			o.parent = parent.ptr
+			o.parentHandle = parent
 		}
 	}
 }
@@ -1130,6 +1145,7 @@ func ToolCall(name string, args json.RawMessage, opts ...ToolCallOption) (*ToolH
 	for _, opt := range opts {
 		opt(o)
 	}
+	defer runtime.KeepAlive(o.parentHandle)
 	defer freeToolOpts(o)
 
 	cName := C.CString(name)
@@ -1153,6 +1169,7 @@ func ToolCall(name string, args json.RawMessage, opts ...ToolCallOption) (*ToolH
 // the sanitized result is JSON null. Response intercepts run only through
 // [ToolCallExecute].
 func ToolCallEnd(handle *ToolHandle, result ToolExecutionResult, opts ...ToolCallOption) error {
+	defer runtime.KeepAlive(handle)
 	o := &toolCallOptions{}
 	for _, opt := range opts {
 		opt(o)
@@ -1185,6 +1202,7 @@ func ToolCallExecute(name string, args json.RawMessage, fn ToolExecutionFunc, op
 	for _, opt := range opts {
 		opt(o)
 	}
+	defer runtime.KeepAlive(o.parentHandle)
 	defer freeToolOpts(o)
 
 	id := registerClosure(fn)
@@ -1221,6 +1239,7 @@ func ToolCallExecute(name string, args json.RawMessage, fn ToolExecutionFunc, op
 // ---------------------------------------------------------------------------
 
 type llmCallOptions struct {
+	parentHandle        *ScopeHandle // retains the borrowed native handle through the FFI call
 	parent              *C.FfiScopeHandle
 	attributes          uint32
 	data                *C.char
@@ -1250,6 +1269,7 @@ func WithLLMParent(parent *ScopeHandle) LLMCallOption {
 	return func(o *llmCallOptions) {
 		if parent != nil {
 			o.parent = parent.ptr
+			o.parentHandle = parent
 		}
 	}
 }
@@ -1433,6 +1453,7 @@ func LlmCall(name string, request interface{}, opts ...LLMCallOption) (*LLMHandl
 	for _, opt := range opts {
 		opt(o)
 	}
+	defer runtime.KeepAlive(o.parentHandle)
 	defer freeLLMOpts(o)
 
 	requestJSON, err := jsonMarshal(request)
@@ -1460,6 +1481,7 @@ func LlmCall(name string, request interface{}, opts ...LLMCallOption) (*LLMHandl
 // is used only when the sanitized response is JSON null. Response intercepts
 // run only through [LlmCallExecute] and [LlmStreamCallExecute].
 func LlmCallEnd(handle *LLMHandle, response json.RawMessage, opts ...LLMCallOption) error {
+	defer runtime.KeepAlive(handle)
 	o := &llmCallOptions{}
 	for _, opt := range opts {
 		opt(o)
@@ -1486,6 +1508,7 @@ func LlmCallExecute(name string, request interface{}, fn LLMExecutionFunc, opts 
 	for _, opt := range opts {
 		opt(o)
 	}
+	defer runtime.KeepAlive(o.parentHandle)
 	defer freeLLMOpts(o)
 
 	requestJSON, err := json.Marshal(request)
@@ -1544,6 +1567,7 @@ func LlmStreamCallExecute(name string, request interface{}, fn LLMExecutionFunc,
 	for _, opt := range opts {
 		opt(o)
 	}
+	defer runtime.KeepAlive(o.parentHandle)
 	defer freeLLMOpts(o)
 
 	requestJSON, err := json.Marshal(request)
@@ -1999,6 +2023,82 @@ func FlushSubscribers() error {
 // Each ScopeStack has its own root scope and is independent of other scope stacks.
 type ScopeStack struct {
 	ptr *C.FfiScopeStack
+}
+
+// ScopeStackEntry identifies one scope in the visible runtime stack.
+type ScopeStackEntry struct {
+	ScopeID   string    `json:"scope_id"`
+	ScopeType ScopeType `json:"-"`
+}
+
+// ScopeStackSnapshot contains owned root-to-top entries, including synthetic roots.
+type ScopeStackSnapshot struct {
+	Scopes []ScopeStackEntry `json:"scopes"`
+}
+
+var snapshotScopeTypeNames = [...]string{"agent", "function", "tool", "llm", "retriever", "embedder", "reranker", "guardrail", "evaluator", "custom", "unknown"}
+
+// MarshalJSON uses the canonical lowercase encoding without changing ScopeType elsewhere.
+func (entry ScopeStackEntry) MarshalJSON() ([]byte, error) {
+	category := "unknown"
+	if entry.ScopeType >= 0 && int(entry.ScopeType) < len(snapshotScopeTypeNames) {
+		category = snapshotScopeTypeNames[entry.ScopeType]
+	}
+	return json.Marshal(struct {
+		ScopeID   string `json:"scope_id"`
+		ScopeType string `json:"scope_type"`
+	}{entry.ScopeID, category})
+}
+
+// UnmarshalJSON validates scope UUIDs and maps future categories to Unknown.
+func (entry *ScopeStackEntry) UnmarshalJSON(payload []byte) error {
+	var encoded struct {
+		ScopeID   string `json:"scope_id"`
+		ScopeType string `json:"scope_type"`
+	}
+	if err := json.Unmarshal(payload, &encoded); err != nil {
+		return err
+	}
+	identifier := encoded.ScopeID
+	if len(identifier) != 36 || identifier[8] != '-' || identifier[13] != '-' || identifier[18] != '-' || identifier[23] != '-' {
+		return errors.New("snapshot scope_id must be a canonical UUID")
+	}
+	hexadecimalIdentifier := strings.ReplaceAll(identifier, "-", "")
+	if len(hexadecimalIdentifier) != 32 {
+		return errors.New("snapshot scope_id must be a canonical UUID")
+	}
+	if _, err := hex.DecodeString(hexadecimalIdentifier); err != nil {
+		return fmt.Errorf("invalid snapshot scope UUID: %w", err)
+	}
+	category := ScopeTypeUnknown
+	for index, name := range snapshotScopeTypeNames {
+		if encoded.ScopeType == name {
+			category = ScopeType(index)
+			break
+		}
+	}
+	entry.ScopeID = strings.ToLower(identifier)
+	entry.ScopeType = category
+	return nil
+}
+
+// CurrentScopeStackSnapshot reads an explicit binding without creating a stack.
+// A nil snapshot means absence. Call inside ScopeStack.Run when a goroutine
+// needs a stable OS-thread binding across CGo calls.
+func CurrentScopeStackSnapshot() (*ScopeStackSnapshot, error) {
+	var output *C.char
+	if err := checkStatus(C.nemo_relay_current_scope_stack_snapshot_json(&output)); err != nil {
+		return nil, err
+	}
+	if output == nil {
+		return nil, nil
+	}
+	defer C.nemo_relay_string_free(output)
+	var snapshot ScopeStackSnapshot
+	if err := json.Unmarshal([]byte(C.GoString(output)), &snapshot); err != nil {
+		return nil, fmt.Errorf("invalid scope stack snapshot: %w", err)
+	}
+	return &snapshot, nil
 }
 
 // PropagationContext is the versioned, transport-neutral causal context used
@@ -2460,6 +2560,8 @@ const (
 // Create it with [NewOpenTelemetryConfig], then mutate fields as needed before
 // passing it to [NewOpenTelemetrySubscriber].
 type OpenTelemetryConfig struct {
+	// TLS sets the certificate and private key file paths for this endpoint.
+	TLS       *OpenTelemetryTLSConfig
 	Type      OpenTelemetryType
 	Transport OpenTelemetryTransport
 	Endpoint  string
@@ -2665,8 +2767,14 @@ func NewOpenTelemetrySubscriber(config OpenTelemetryConfig) (*OpenTelemetrySubsc
 	cPromoteResourceMetadataPrefixesJSON := C.CString(string(promoteResourceMetadataPrefixesJSON))
 	defer C.free(unsafe.Pointer(cPromoteResourceMetadataPrefixesJSON))
 
+	tlsJSON, err := jsonMarshal(config.TLS)
+	if err != nil {
+		return nil, err
+	}
+	cTLSJSON := C.CString(string(tlsJSON))
+	defer C.free(unsafe.Pointer(cTLSJSON))
 	var ptr unsafe.Pointer
-	status := C.nemo_relay_otel_subscriber_create_with_projection_options_v5(
+	status := C.nemo_relay_otel_subscriber_create_with_projection_options_with_tls(
 		cType,
 		cTransport,
 		cEndpoint,
@@ -2684,6 +2792,7 @@ func NewOpenTelemetrySubscriber(config OpenTelemetryConfig) (*OpenTelemetrySubsc
 		cPromoteMetadataPrefixesJSON,
 		cPromoteResourceMetadataPrefixesJSON,
 		C.uint64_t(*config.CompletedSpanContextTTL/time.Millisecond),
+		cTLSJSON,
 		&ptr,
 	)
 	if err := checkStatus(status); err != nil {
@@ -2903,6 +3012,8 @@ func (s *OpenTelemetrySubscriber) Close() {
 
 // OpenTelemetryLogConfig configures an independent OTLP log subscriber.
 type OpenTelemetryLogConfig struct {
+	// TLS sets the certificate and private key file paths for this endpoint.
+	TLS       *OpenTelemetryTLSConfig
 	Transport OpenTelemetryTransport
 	Endpoint  string
 	Headers   map[string]string
@@ -2956,6 +3067,8 @@ const (
 
 // OpenTelemetryMetricConfig configures an independent OTLP metric subscriber.
 type OpenTelemetryMetricConfig struct {
+	// TLS sets the certificate and private key file paths for this endpoint.
+	TLS       *OpenTelemetryTLSConfig
 	Transport OpenTelemetryTransport
 	Endpoint  string
 	Headers   map[string]string
@@ -3136,8 +3249,14 @@ func NewOpenTelemetryLogSubscriber(config OpenTelemetryLogConfig) (*OpenTelemetr
 	defer common.free()
 	cSeverity := C.CString(string(config.MinimumSeverity))
 	defer C.free(unsafe.Pointer(cSeverity))
+	tlsJSON, err := jsonMarshal(config.TLS)
+	if err != nil {
+		return nil, err
+	}
+	cTLSJSON := C.CString(string(tlsJSON))
+	defer C.free(unsafe.Pointer(cTLSJSON))
 	var ptr unsafe.Pointer
-	status := C.nemo_relay_otel_log_subscriber_create_v2(
+	status := C.nemo_relay_otel_log_subscriber_create_with_tls(
 		common.transport,
 		common.endpoint,
 		common.headers,
@@ -3153,6 +3272,7 @@ func NewOpenTelemetryLogSubscriber(config OpenTelemetryLogConfig) (*OpenTelemetr
 		C.uint64_t(config.MaxExportBatchSize),
 		C.uint64_t(config.ScheduledDelay/time.Millisecond),
 		C.uint64_t(config.CompletedSpanContextTTL/time.Millisecond),
+		cTLSJSON,
 		&ptr,
 	)
 	if err := checkStatus(status); err != nil {
@@ -3268,8 +3388,14 @@ func NewOpenTelemetryMetricSubscriber(config OpenTelemetryMetricConfig) (*OpenTe
 	defer common.free()
 	cTemporality := C.CString(string(config.Temporality))
 	defer C.free(unsafe.Pointer(cTemporality))
+	tlsJSON, err := jsonMarshal(config.TLS)
+	if err != nil {
+		return nil, err
+	}
+	cTLSJSON := C.CString(string(tlsJSON))
+	defer C.free(unsafe.Pointer(cTLSJSON))
 	var ptr unsafe.Pointer
-	status := C.nemo_relay_otel_metric_subscriber_create_v2(
+	status := C.nemo_relay_otel_metric_subscriber_create_with_tls(
 		common.transport,
 		common.endpoint,
 		common.headers,
@@ -3284,6 +3410,7 @@ func NewOpenTelemetryMetricSubscriber(config OpenTelemetryMetricConfig) (*OpenTe
 		cTemporality,
 		C.uint64_t(config.MaxInstruments),
 		C.uint64_t(config.CardinalityLimit),
+		cTLSJSON,
 		&ptr,
 	)
 	if err := checkStatus(status); err != nil {

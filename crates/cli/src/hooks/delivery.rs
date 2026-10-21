@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io::Read;
-use std::time::Duration;
 
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+#[cfg(test)]
+use reqwest::header::CONTENT_TYPE;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
 use crate::error::CliError;
@@ -16,18 +17,44 @@ use super::destination::{
     transparent_run_active, wait_for_existing_gateway,
 };
 use super::response::MAX_HOOK_RESPONSE_BYTES;
-use super::response::{
-    HookDeliveryOutcome, handle_hook_forward_response_with_context,
-    handle_verified_hook_forward_response_with_context,
-};
-use super::{GatewayMode, HookForwardRequest};
+use super::response::{HookDeliveryOutcome, handle_verified_hook_forward_response_with_context};
+use super::{GatewayMode, HOOK_FORWARD_TIMEOUT, HookForwardRequest};
 
-const HOOK_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
+/// Pi invokes the same credentialed sender as native command hooks, but consumes the raw
+/// HTTP verdict itself so transport faults retain the extension's existing failure policy.
+pub(crate) async fn hook_forward_pi(command: HookForwardRequest) -> Result<(), CliError> {
+    let operational = OperationalContext::new();
+    let destination = hook_destination(&command);
+    // The challenge accepts any caller fingerprint, including on a standalone gateway.
+    // Reuse the pinned TLS sender so the hook payload reaches only an authenticated Relay.
+    let gateway = transparent_gateway_spec(&destination.gateway_url)?;
+    let input = read_hook_payload(
+        crate::configuration::DEFAULT_MAX_HOOK_PAYLOAD_BYTES,
+        &operational,
+    )?;
+    let response = send_verified_hook_forward_request_with_context(
+        &command,
+        &gateway,
+        &destination.gateway_url,
+        input,
+        &operational,
+        false,
+    )
+    .await?
+    .map_err(|error| CliError::Launch(error.to_string()))?;
+    let body = String::from_utf8(response.body)
+        .map_err(|error| CliError::Install(format!("pi hook response is not UTF-8: {error}")))?;
+    println!(
+        "{}",
+        serde_json::json!({"status": response.status, "body": body})
+    );
+    Ok(())
+}
 
 pub(crate) async fn hook_forward(mut command: HookForwardRequest) -> Result<(), CliError> {
     let operational = OperationalContext::new();
     operational::hook_started(&operational, "hook_forward");
-    let fail_closed = command.failure_policy.fail_closed();
+    let fail_closed = super::effective_fail_closed(command.failure_policy, None);
     // Persistent hooks do not carry this marker, so they can become inert without reading a
     // stale configuration file while a process-private transparent gateway is active. Generated
     // transparent wrappers do carry it and still load their private configuration fail-closed.
@@ -51,8 +78,7 @@ pub(crate) async fn hook_forward(mut command: HookForwardRequest) -> Result<(), 
         Ok(persistent) => persistent,
         Err(error) => return handle_hook_error(error, fail_closed, &operational),
     };
-    let transparent_gateway = match command
-        .transparent_run
+    let transparent_gateway = match (destination.lifecycle == HookGatewayLifecycle::Transparent)
         .then(|| transparent_gateway_spec(&destination.gateway_url))
         .transpose()
     {
@@ -71,18 +97,7 @@ pub(crate) async fn hook_forward(mut command: HookForwardRequest) -> Result<(), 
         Ok(input) => input,
         Err(error) => return handle_hook_error(error, fail_closed, &operational),
     };
-    if destination.lifecycle == HookGatewayLifecycle::Existing {
-        let gateway = persistent
-            .as_ref()
-            .expect("existing persistent destinations resolve a gateway")
-            .gateway
-            .clone();
-        if let Err(error) =
-            wait_for_existing_gateway(gateway, destination.gateway_url.clone()).await
-        {
-            return handle_hook_error(error, fail_closed, &operational);
-        }
-    }
+    let fail_closed = super::effective_fail_closed(command.failure_policy, Some(input.as_bytes()));
     let verified_gateway = persistent
         .as_ref()
         .map(|launch| &launch.gateway)
@@ -94,6 +109,7 @@ pub(crate) async fn hook_forward(mut command: HookForwardRequest) -> Result<(), 
             &destination.gateway_url,
             input,
             &operational,
+            destination.lifecycle == HookGatewayLifecycle::Existing,
         )
         .await
         {
@@ -118,27 +134,11 @@ pub(crate) async fn hook_forward(mut command: HookForwardRequest) -> Result<(), 
         };
     }
 
-    let url = format!(
-        "{}{}",
-        destination.gateway_url.trim_end_matches('/'),
-        command.agent.hook_path()
-    );
-    let response = match send_hook_forward_request(&command, &url, input, &operational).await {
-        Ok(response) => response,
-        Err(error) => return handle_hook_error(error, fail_closed, &operational),
-    };
-    match handle_hook_forward_response_with_context(response, fail_closed, &operational).await {
-        Ok(HookDeliveryOutcome::Completed) => {
-            operational::hook_completed(&operational, "hook_forward", "completed");
-            Ok(())
-        }
-        Ok(HookDeliveryOutcome::FailedOpen) => Ok(()),
-        Err(error) if error.guardrail_rejection_reason().is_some() => {
-            operational::hook_completed(&operational, "hook_forward", "rejected");
-            Err(error)
-        }
-        Err(error) => Err(error),
-    }
+    handle_hook_error(
+        CliError::Launch("hook destination has no authenticated gateway".into()),
+        fail_closed,
+        &operational,
+    )
 }
 
 pub(crate) fn transparent_hook_is_inert(command: &HookForwardRequest) -> bool {
@@ -192,7 +192,9 @@ fn handle_hook_error(
             error_kind = error.log_kind();
             "Hook delivery failed"
         );
-        Err(error)
+        Err(CliError::HookDelivery {
+            source: Box::new(error),
+        })
     } else {
         log::warn!(
             target: "nemo_relay.hook",
@@ -258,6 +260,7 @@ pub(crate) async fn send_verified_hook_forward_request(
         gateway_url,
         input,
         &operational,
+        false,
     )
     .await
 }
@@ -268,6 +271,7 @@ async fn send_verified_hook_forward_request_with_context(
     gateway_url: &str,
     input: String,
     operational: &OperationalContext,
+    wait_for_ready: bool,
 ) -> Result<
     Result<crate::gateway::client::VerifiedHttpResponse, crate::gateway::client::VerifiedHttpError>,
     CliError,
@@ -296,22 +300,40 @@ async fn send_verified_hook_forward_request_with_context(
     let gateway_url = gateway_url.to_string();
     let path = command.agent.hook_path().to_string();
     tokio::task::spawn_blocking(move || {
-        gateway.post_verified(
+        let deadline = std::time::Instant::now() + super::destination::HOOK_GATEWAY_RETRY_TIMEOUT;
+        if wait_for_ready {
+            match gateway.post_verified_preflight(
+                &gateway_url,
+                &path,
+                &headers,
+                input.as_bytes(),
+                HOOK_FORWARD_TIMEOUT,
+                MAX_HOOK_RESPONSE_BYTES,
+            ) {
+                Ok(response) => return Ok(Ok(response)),
+                Err(error) if error.readiness_failed() => {
+                    wait_for_existing_gateway(&gateway, &gateway_url, deadline)?;
+                }
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+        Ok(gateway.post_verified(
             &gateway_url,
             &path,
             &headers,
             input.as_bytes(),
             HOOK_FORWARD_TIMEOUT,
             MAX_HOOK_RESPONSE_BYTES,
-        )
+        ))
     })
     .await
-    .map_err(|error| CliError::Launch(format!("verified hook request task failed: {error}")))
+    .map_err(|error| CliError::Launch(format!("verified hook request task failed: {error}")))?
 }
 
 // Sends the hook payload with gateway-specific headers translated from CLI flags. The reqwest
 // transport result is returned separately so response handling can preserve fail-open semantics.
-async fn send_hook_forward_request(
+#[cfg(test)]
+pub(super) async fn send_hook_forward_request(
     command: &HookForwardRequest,
     url: &str,
     input: String,

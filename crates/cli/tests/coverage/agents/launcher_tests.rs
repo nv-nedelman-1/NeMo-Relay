@@ -77,6 +77,7 @@ impl Drop for DropSignal {
 #[test]
 fn infers_agent_from_command_or_uses_override() {
     let command = RunOverrides {
+        chatgpt_codex_base_url: None,
         agent: None,
         config: None,
         openai_base_url: None,
@@ -92,6 +93,7 @@ fn infers_agent_from_command_or_uses_override() {
     assert_eq!(argv, vec!["/usr/bin/codex"]);
 
     let command = RunOverrides {
+        chatgpt_codex_base_url: None,
         agent: Some(CodingAgent::ClaudeCode),
         command: vec!["wrapper".into()],
         ..command
@@ -133,6 +135,7 @@ fn uses_configured_command_when_no_argv_is_supplied() {
         ..AgentConfigs::default()
     };
     let command = RunOverrides {
+        chatgpt_codex_base_url: None,
         agent: Some(CodingAgent::Codex),
         config: None,
         openai_base_url: None,
@@ -153,6 +156,7 @@ fn uses_configured_command_when_no_argv_is_supplied() {
 #[test]
 fn inference_failure_has_actionable_message() {
     let command = RunOverrides {
+        chatgpt_codex_base_url: None,
         agent: None,
         config: None,
         openai_base_url: None,
@@ -178,6 +182,7 @@ fn missing_command_without_agent_errors() {
     // binary name (for example, `codex`), so that branch is exercised in the resolution test
     // below rather than here.
     let command = RunOverrides {
+        chatgpt_codex_base_url: None,
         agent: None,
         config: None,
         openai_base_url: None,
@@ -201,6 +206,7 @@ fn agent_without_configured_command_falls_back_to_default_binary() {
     // `--agent codex` with no `[agents.codex] command = "..."` override resolves to the
     // default executable name on $PATH.
     let command = RunOverrides {
+        chatgpt_codex_base_url: None,
         agent: Some(CodingAgent::Codex),
         config: None,
         openai_base_url: None,
@@ -222,6 +228,7 @@ fn agent_with_passthrough_args_appends_to_configured_command() {
     // The easy-path uses this code path: `nemo-relay codex -- --model X` resolves to the
     // configured (or default) codex command with `--model X` appended.
     let command = RunOverrides {
+        chatgpt_codex_base_url: None,
         agent: Some(CodingAgent::Codex),
         config: None,
         openai_base_url: None,
@@ -1158,6 +1165,7 @@ fn invocation_resolves_wrapper_host_before_appending_pass_through_arguments() {
         ..AgentConfigs::default()
     };
     let command = RunOverrides {
+        chatgpt_codex_base_url: None,
         agent: Some(CodingAgent::Codex),
         config: None,
         openai_base_url: None,
@@ -1250,6 +1258,7 @@ async fn transparent_launch_retains_agent_version_for_claude_and_codex() {
         .unwrap();
         make_executable(&executable);
         let command = RunOverrides {
+            chatgpt_codex_base_url: None,
             agent: None,
             config: Some(config.clone()),
             openai_base_url: None,
@@ -1272,6 +1281,7 @@ async fn transparent_launch_retains_agent_version_for_claude_and_codex() {
 
         let dry_run = TransparentRun::new(
             RunOverrides {
+                chatgpt_codex_base_url: None,
                 dry_run: true,
                 ..command
             },
@@ -1965,6 +1975,7 @@ async fn run_starts_gateway_injects_env_and_returns_agent_exit_code() {
     let output = temp.path().join("env.txt");
     let command_argv = fake_agent_command(temp.path(), &output);
     let command = RunOverrides {
+        chatgpt_codex_base_url: None,
         // Leave `agent: None` so the launcher infers from argv[0] and uses `command_argv`
         // (our fake-agent.sh) as the full argv. With --agent set, the resolver appends
         // command as pass-through after the configured/default binary — not what this test
@@ -2010,6 +2021,7 @@ fn fake_agent_command(temp: &Path, output: &Path) -> Vec<String> {
 #[tokio::test]
 async fn dry_run_does_not_spawn_agent() {
     let command = RunOverrides {
+        chatgpt_codex_base_url: None,
         agent: None,
         config: None,
         openai_base_url: None,
@@ -2041,6 +2053,7 @@ async fn transparent_launcher_does_not_initialize_logging_sinks_directly() {
     .unwrap();
 
     let command = RunOverrides {
+        chatgpt_codex_base_url: None,
         agent: Some(CodingAgent::Codex),
         config: Some(config_path),
         openai_base_url: None,
@@ -2107,6 +2120,7 @@ entrypoint = "acme.worker:create_plugin"
     .unwrap();
 
     let command = RunOverrides {
+        chatgpt_codex_base_url: None,
         agent: Some(CodingAgent::Codex),
         config: Some(config_path),
         openai_base_url: None,
@@ -2772,4 +2786,61 @@ async fn supervised_resource_metrics_selects_the_owned_child_and_restores_target
     assert!(resource_metrics::collect().await.is_err());
     drop(launch);
     host.close().unwrap();
+}
+
+#[test]
+fn transparent_codex_launch_injects_voice_url_without_overriding_cli_or_profiles() {
+    let _guard = current_dir_lock().lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let _env = EnvScope::set(&[("CODEX_HOME", Some(dir.path().as_os_str()))]);
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "forced_login_method = \"chatgpt\"\n[profiles.custom]\nexperimental_realtime_webrtc_call_base_url = \"https://voice.example/custom\"\n").unwrap();
+    let resolved = ResolvedConfig::default();
+    let generated =
+        "experimental_realtime_webrtc_call_base_url=\"http://127.0.0.1:47999/backend-api/codex\"";
+    for (argv, inject) in [
+        (vec!["codex", "exec", "prompt"], true),
+        (vec!["codex", "--profile", "custom"], false),
+        (vec!["codex", "--profile=custom"], false),
+        (
+            vec![
+                "codex",
+                "-c",
+                "experimental_realtime_webrtc_call_base_url=\"https://voice.example/cli\"",
+            ],
+            false,
+        ),
+        (
+            vec![
+                "codex",
+                "--config=experimental_realtime_webrtc_call_base_url=\"https://voice.example/cli\"",
+            ],
+            false,
+        ),
+        (vec!["codex", "-c", "forced_login_method=\"api\""], false),
+        (
+            vec![
+                "codex",
+                "exec",
+                "--",
+                "experimental_realtime_webrtc_call_base_url=prompt",
+            ],
+            true,
+        ),
+    ] {
+        let prepared = PreparedAgentLaunch::new(
+            CodingAgent::Codex,
+            argv.into_iter().map(str::to_string).collect(),
+            "http://127.0.0.1:47999",
+            &resolved,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.argv.iter().any(|arg| arg == generated),
+            inject,
+            "{:?}",
+            prepared.argv
+        );
+    }
 }

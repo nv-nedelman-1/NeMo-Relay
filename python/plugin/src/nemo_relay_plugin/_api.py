@@ -55,6 +55,7 @@ Public callback aliases used in registration annotations:
     LlmStreamExecutionCallback: Streaming LLM execution intercept callback.
 
 Public functions:
+    http_error_message: Format an upstream HTTP error status for forwarding.
     serve_plugin: Run a local ``grpc-v1`` worker until host shutdown.
 """
 
@@ -1008,6 +1009,21 @@ class ScopeType(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class ScopeStackEntry:
+    """Canonical scope UUID and semantic type from the visible stack."""
+
+    scope_id: str
+    scope_type: ScopeType
+
+
+@dataclass(frozen=True, slots=True)
+class ScopeStackSnapshot:
+    """Detached root-to-top entries including implicit and synthetic roots."""
+
+    scopes: list[ScopeStackEntry]
+
+
+@dataclass(frozen=True, slots=True)
 class _BoundScopeContext:
     scope_stack_id: str
     parent_scope_id: str | None = None
@@ -1878,6 +1894,38 @@ class PluginRuntime:
             )
         )
         _ack_to_result(response)
+
+    async def current_scope_stack_snapshot(self) -> ScopeStackSnapshot | None:
+        """Return owned scope UUIDs/types, or None when no context is bound.
+
+        Raises:
+            WorkerSdkError: Unsupported hosts or invalid/expired bindings.
+                Inspection never creates a stack.
+        """
+        try:
+            response = await self._host_stub.GetCurrentScopeStackSnapshot(
+                pb.GetCurrentScopeStackSnapshotRequest(
+                    activation_id=self._activation_id,
+                    auth_token=self._auth_token,
+                    scope=self._scope_context(),
+                )
+            )
+        except grpc.aio.AioRpcError as error:
+            if error.code() == grpc.StatusCode.UNIMPLEMENTED:
+                raise WorkerSdkError(
+                    "scope stack snapshots are unsupported by this host; require the grpc-v1 snapshot extension"
+                ) from error
+            raise WorkerSdkError(f"GetCurrentScopeStackSnapshot failed: {error.details()}") from error
+        if response.HasField("error"):
+            raise _worker_error_to_sdk(response.error)
+        if not response.HasField("snapshot"):
+            return None
+        categories = {_proto_scope_type(category): category for category in ScopeType}
+        entries = []
+        for entry in response.snapshot.scopes:
+            category = categories.get(entry.scope_type, ScopeType.UNKNOWN)
+            entries.append(ScopeStackEntry(entry.scope_id, category))
+        return ScopeStackSnapshot(entries)
 
     async def runtime_diagnostics(self) -> RuntimeDiagnostics:
         """Return a bounded snapshot of active host runtime diagnostics.
@@ -3023,6 +3071,8 @@ def _stream_chunk_to_value(chunk: Any) -> Json:
 
 
 def _worker_error_to_sdk(error: Any) -> WorkerSdkError:
+    if error.code != "worker.cancelled" and _is_http_error_message(error.message):
+        return WorkerSdkError(error.message)
     return WorkerSdkError(f"{error.code}: {error.message}")
 
 
@@ -3260,3 +3310,18 @@ async def _unlink_unix_socket(endpoint: str) -> None:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(writer.wait_closed(), timeout=1)
             raise WorkerSdkError(f"worker socket path {path} is already active")
+
+
+def http_error_message(status: int, message: str) -> str:
+    """Format an HTTP error status (400–599) for Relay plugin error forwarding."""
+    if not isinstance(status, int) or not 400 <= status <= 599:
+        raise ValueError("plugin HTTP error status must be between 400 and 599")
+    return f"HTTP {status}: {message}"
+
+
+def _is_http_error_message(message: str) -> bool:
+    prefix = "HTTP "
+    if not message.startswith(prefix):
+        return False
+    code, separator, _body = message[len(prefix) :].partition(": ")
+    return bool(separator) and len(code) == 3 and code.isascii() and code.isdigit() and 400 <= int(code) <= 599

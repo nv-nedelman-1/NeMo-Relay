@@ -47,30 +47,54 @@ impl SubagentSessionContext {
 pub(crate) enum GatewayRouteKind {
     OpenAiResponses,
     OpenAiChatCompletions,
+    OpenAiResponsesCompact,
+    OpenAiRealtime,
+    OpenAiRealtimeCalls,
+    OpenAiLive,
     OpenAiImagesGenerations,
+    OpenAiImagesEdits,
+    OpenAiMemoriesSummarize,
+    OpenAiStandaloneSearch,
     OpenAiModels,
     AnthropicMessages,
     AnthropicCountTokens,
+    AnthropicModels,
 }
 
 impl GatewayRouteKind {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 14] = [
         Self::OpenAiResponses,
         Self::OpenAiChatCompletions,
+        Self::OpenAiResponsesCompact,
+        Self::OpenAiRealtime,
+        Self::OpenAiRealtimeCalls,
+        Self::OpenAiLive,
         Self::OpenAiImagesGenerations,
+        Self::OpenAiImagesEdits,
+        Self::OpenAiMemoriesSummarize,
+        Self::OpenAiStandaloneSearch,
         Self::OpenAiModels,
         Self::AnthropicMessages,
         Self::AnthropicCountTokens,
+        Self::AnthropicModels,
     ];
 
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::OpenAiResponses => "openai.responses",
             Self::OpenAiChatCompletions => "openai.chat_completions",
+            Self::OpenAiResponsesCompact => "openai.responses.compact",
+            Self::OpenAiRealtime => "openai.realtime",
+            Self::OpenAiRealtimeCalls => "openai.realtime.calls",
+            Self::OpenAiLive => "openai.live",
             Self::OpenAiImagesGenerations => "openai.images.generations",
+            Self::OpenAiImagesEdits => "openai.images.edits",
+            Self::OpenAiMemoriesSummarize => "openai.memories.trace_summarize",
+            Self::OpenAiStandaloneSearch => "openai.alpha.search",
             Self::OpenAiModels => "openai.models",
             Self::AnthropicMessages => "anthropic.messages",
             Self::AnthropicCountTokens => "anthropic.count_tokens",
+            Self::AnthropicModels => "anthropic.models",
         }
     }
 
@@ -491,10 +515,19 @@ fn provider_request_extractor(route: GatewayRouteKind) -> &'static dyn ProviderR
     match route {
         GatewayRouteKind::OpenAiResponses => &OPENAI_RESPONSES_REQUEST_EXTRACTOR,
         GatewayRouteKind::OpenAiChatCompletions => &OPENAI_CHAT_COMPLETIONS_REQUEST_EXTRACTOR,
-        GatewayRouteKind::OpenAiImagesGenerations => &OPENAI_MODELS_REQUEST_EXTRACTOR,
+        GatewayRouteKind::OpenAiRealtime
+        | GatewayRouteKind::OpenAiResponsesCompact
+        | GatewayRouteKind::OpenAiRealtimeCalls => &OPENAI_MODELS_REQUEST_EXTRACTOR,
+        GatewayRouteKind::OpenAiLive => &OPENAI_MODELS_REQUEST_EXTRACTOR,
+        GatewayRouteKind::OpenAiImagesGenerations
+        | GatewayRouteKind::OpenAiImagesEdits
+        | GatewayRouteKind::OpenAiMemoriesSummarize
+        | GatewayRouteKind::OpenAiStandaloneSearch => &OPENAI_MODELS_REQUEST_EXTRACTOR,
         GatewayRouteKind::OpenAiModels => &OPENAI_MODELS_REQUEST_EXTRACTOR,
         GatewayRouteKind::AnthropicMessages => &ANTHROPIC_MESSAGES_REQUEST_EXTRACTOR,
-        GatewayRouteKind::AnthropicCountTokens => &ANTHROPIC_COUNT_TOKENS_REQUEST_EXTRACTOR,
+        GatewayRouteKind::AnthropicCountTokens | GatewayRouteKind::AnthropicModels => {
+            &ANTHROPIC_COUNT_TOKENS_REQUEST_EXTRACTOR
+        }
     }
 }
 

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, cast
 from unittest import mock
+from uuid import UUID
 
 import pytest
 
@@ -3774,3 +3775,121 @@ async def test_tool_execution_intercept_tool_call_id_is_none_when_absent() -> No
     )
 
     assert seen["tool_call_id"] is None
+
+
+@pytest.mark.parametrize("status", range(400, 600))
+def test_http_error_prefix_survives_worker_and_next_round_trip(status: int) -> None:
+    from nemo_relay_plugin import http_error_message
+    from nemo_relay_plugin._api import _sdk_error_to_worker, _worker_error_to_sdk
+
+    message = http_error_message(status, "provider failure")
+    wire = _sdk_error_to_worker(WorkerSdkError(message))
+    assert wire.message == message
+    assert not wire.retryable
+    assert _sdk_error_to_worker(_worker_error_to_sdk(wire)).message == message
+
+
+@pytest.mark.parametrize("message", ["plain failure", "http 403: denied", "HTTP 200: success", "HTTP ４０３: denied"])
+def test_unrecognized_http_error_prefix_keeps_worker_error_code(message: str) -> None:
+    from nemo_relay_plugin._api import _sdk_error_to_worker, _worker_error_to_sdk
+
+    wire = _sdk_error_to_worker(WorkerSdkError(message))
+    assert str(_worker_error_to_sdk(wire)) == f"{wire.code}: {message}"
+
+
+@pytest.mark.parametrize("status", [0, 200, 399, 600, 403.0, True])
+def test_http_error_message_rejects_invalid_status(status: Any) -> None:
+    from nemo_relay_plugin import http_error_message
+
+    with pytest.raises(ValueError, match="between 400 and 599"):
+        http_error_message(status, "invalid")
+
+
+def test_worker_cancellation_keeps_code_even_with_http_prefix() -> None:
+    from nemo_relay_plugin._api import _sdk_error_to_worker, _worker_error_to_sdk
+
+    wire = _sdk_error_to_worker(WorkerSdkError("HTTP 403: denied"))
+    wire.code = "worker.cancelled"
+    assert str(_worker_error_to_sdk(wire)) == "worker.cancelled: HTTP 403: denied"
+
+
+async def test_scope_stack_snapshot_converts_types_and_reads_each_binding_fresh() -> None:
+    identifiers = [str(UUID(int=number)) for number in range(1, 14)]
+    snapshot = pb.ScopeStackSnapshot(
+        scopes=[
+            pb.ScopeStackEntry(scope_id=identifier, scope_type=category)
+            for identifier, category in zip(identifiers, list(range(1, 12)) + [0, 999], strict=True)
+        ]
+    )
+    snapshot_response = pb.GetCurrentScopeStackSnapshotResponse(snapshot=snapshot)
+    host = mock.Mock()
+    host.GetCurrentScopeStackSnapshot = mock.AsyncMock(
+        side_effect=[
+            pb.GetCurrentScopeStackSnapshotResponse(),
+            snapshot_response,
+            pb.GetCurrentScopeStackSnapshotResponse(snapshot=pb.ScopeStackSnapshot(scopes=snapshot.scopes[:1])),
+            pb.GetCurrentScopeStackSnapshotResponse(),
+        ]
+    )
+    runtime = PluginRuntime(activation_id=ACTIVATION_ID, auth_token=AUTH_TOKEN, host_stub=host)
+    assert await runtime.current_scope_stack_snapshot() is None
+    with runtime.bind_scope_stack("first", parent_scope_id=identifiers[1]):
+        retained = await runtime.current_scope_stack_snapshot()
+        assert retained is not None
+        assert [entry.scope_id for entry in retained.scopes] == identifiers
+        assert [entry.scope_type for entry in retained.scopes] == list(ScopeType) + [ScopeType.UNKNOWN] * 2
+        retained.scopes.pop()
+        with runtime.bind_scope_stack("second", parent_scope_id=identifiers[0]):
+            current = await runtime.current_scope_stack_snapshot()
+            assert current is not None
+            assert len(current.scopes) == 1
+            current.scopes.clear()
+        assert [entry.scope_id for entry in retained.scopes] == identifiers[:-1]
+        assert [entry.scope_id for entry in snapshot_response.snapshot.scopes] == identifiers
+        assert [entry.scope_id for entry in snapshot.scopes] == identifiers
+    assert await runtime.current_scope_stack_snapshot() is None
+    requests = [call.args[0] for call in host.GetCurrentScopeStackSnapshot.await_args_list]
+    assert [request.scope.scope_stack_id for request in requests] == ["", "first", "second", ""]
+    assert [request.scope.parent_scope_id for request in requests] == ["", identifiers[1], identifiers[0], ""]
+    assert all(request.activation_id == ACTIVATION_ID and request.auth_token == AUTH_TOKEN for request in requests)
+
+
+async def test_scope_stack_snapshot_distinguishes_host_error_and_unsupported_rpc() -> None:
+    host = mock.Mock()
+    host.GetCurrentScopeStackSnapshot = mock.AsyncMock(
+        return_value=pb.GetCurrentScopeStackSnapshotResponse(error=_worker_error("expired binding"))
+    )
+    runtime = PluginRuntime(activation_id=ACTIVATION_ID, auth_token=AUTH_TOKEN, host_stub=host)
+    with pytest.raises(WorkerSdkError, match="expired binding"):
+        await runtime.current_scope_stack_snapshot()
+    for status, message in [
+        (grpc.StatusCode.UNIMPLEMENTED, "grpc-v1 snapshot extension"),
+        (grpc.StatusCode.PERMISSION_DENIED, "GetCurrentScopeStackSnapshot failed: denied"),
+    ]:
+        host.GetCurrentScopeStackSnapshot.side_effect = grpc.aio.AioRpcError(
+            status, initial_metadata=(), trailing_metadata=(), details="denied"
+        )
+        with pytest.raises(WorkerSdkError, match=message):
+            await runtime.current_scope_stack_snapshot()
+
+
+async def test_scope_stack_snapshot_matches_shared_fixture() -> None:
+    fixture_path = Path(__file__).resolve().parents[3] / "crates/types/tests/fixtures/scope_stack_snapshot.json"
+    entries = json.loads(fixture_path.read_text())["scopes"]
+    host = mock.Mock()
+    host.GetCurrentScopeStackSnapshot = mock.AsyncMock(
+        return_value=pb.GetCurrentScopeStackSnapshotResponse(
+            snapshot=pb.ScopeStackSnapshot(
+                scopes=[
+                    pb.ScopeStackEntry(
+                        scope_id=entry["scope_id"], scope_type=plugin_api._proto_scope_type(entry["scope_type"])
+                    )
+                    for entry in entries
+                ]
+            )
+        )
+    )
+    runtime = PluginRuntime(activation_id=ACTIVATION_ID, auth_token=AUTH_TOKEN, host_stub=host)
+    snapshot = await runtime.current_scope_stack_snapshot()
+    assert snapshot is not None
+    assert [{"scope_id": entry.scope_id, "scope_type": entry.scope_type.value} for entry in snapshot.scopes] == entries

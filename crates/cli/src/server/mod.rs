@@ -9,6 +9,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,7 +31,7 @@ use reqwest::Client;
 use serde_json::Value;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 
 use crate::agents::shared::adapters::{claude_code, codex, pi};
 use crate::configuration::{
@@ -42,6 +43,9 @@ use crate::gateway;
 use crate::operational::{self, OperationalContext};
 use crate::plugins::lifecycle::{ActiveDynamicPluginComponent, DynamicPluginActivationSnapshot};
 use crate::sessions::SessionManager;
+
+pub(crate) const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 256;
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -55,14 +59,28 @@ pub(crate) struct AppState {
     pub(crate) transparent_proxy_credential:
         Option<crate::provider_auth::TransparentProxyCredential>,
     pub(crate) http: Client,
+    /// Configured helper requests cannot reuse credentials through redirects or transport retries.
+    pub(crate) http_helper: Client,
     /// Client for caller-named destinations; does not follow redirects. See `upstream_client`.
     pub(crate) http_no_redirect: Client,
     pub(crate) sessions: SessionManager,
     pub(crate) last_activity: Arc<Mutex<Instant>>,
+    pub(crate) active_websockets: Arc<AtomicUsize>,
     pub(crate) bootstrap_shutdown: Option<BootstrapShutdown>,
     pub(crate) instance_id: String,
     pub(crate) bootstrap_tls: Option<Arc<rustls::ServerConfig>>,
+    pub(crate) bootstrap_handshake_permits: Arc<Semaphore>,
     pub(crate) local_address: Option<SocketAddr>,
+}
+
+/// Keeps an unmanaged tunnel active without creating an LLM session or event.
+pub(crate) struct WebSocketActivity(AppState);
+
+impl Drop for WebSocketActivity {
+    fn drop(&mut self) {
+        self.0.touch();
+        self.0.active_websockets.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Clone)]
@@ -272,16 +290,16 @@ async fn serve_listener_with_dynamic_inner(
         transparent_proxy_credential,
     } = bootstrap;
     let bootstrap_challenge_key = Some(BootstrapChallengeKey::load()?);
-    let bootstrap_tls = bootstrap_fingerprint
-        .as_ref()
-        .map(|_| crate::gateway::tls::RelayTlsIdentity::load_or_create())
-        .transpose()
-        .map_err(CliError::Launch)?
-        .map(|identity| identity.server_config())
-        .transpose()
-        .map_err(CliError::Launch)?;
-    let require_provider_client_token =
-        bootstrap_fingerprint.is_some() && transparent_proxy_credential.is_none();
+    // Standalone local pi hooks use the same pinned TLS delivery as installed command hooks.
+    let bootstrap_tls = (bootstrap_fingerprint.is_some()
+        || listener.local_addr()?.ip().is_loopback())
+    .then(crate::gateway::tls::RelayTlsIdentity::load_or_create)
+    .transpose()
+    .map_err(CliError::Launch)?
+    .map(|identity| identity.server_config())
+    .transpose()
+    .map_err(CliError::Launch)?;
+    let require_provider_client_token = transparent_proxy_credential.is_none();
     let plugin_activation =
         activate_server_plugins(config.plugin_config.clone(), dynamic_plugins).await?;
     let (bootstrap_shutdown, bootstrap_shutdown_rx) =
@@ -298,7 +316,7 @@ async fn serve_listener_with_dynamic_inner(
     state.local_address = Some(listener.local_addr()?);
     let instance_id = state.instance_id.clone();
     let sessions = state.sessions.clone();
-    let last_activity = state.last_activity.clone();
+    let idle_state = state.clone();
     let app = router_with_state(state);
     let local_address = listener.local_addr()?;
     if let Some(identity) = managed_bootstrap.as_ref() {
@@ -323,11 +341,7 @@ async fn serve_listener_with_dynamic_inner(
     let idle_shutdown: Option<ShutdownFuture> =
         if matches!(&shutdown_mode, None | Some(ShutdownMode::ProcessSignal)) {
             plugin_idle_timeout()?.map(|timeout| {
-                Box::pin(idle_shutdown_future(
-                    last_activity,
-                    sessions.clone(),
-                    timeout,
-                )) as ShutdownFuture
+                Box::pin(idle_shutdown_future(idle_state, timeout)) as ShutdownFuture
             })
         } else {
             None
@@ -498,7 +512,7 @@ pub(crate) fn router(config: GatewayConfig) -> Router {
 impl AppState {
     #[cfg(test)]
     pub(crate) fn new(config: GatewayConfig) -> Self {
-        Self::new_with_bootstrap(config, None, None, false, None, None)
+        Self::new_with_bootstrap(config, None, None, true, None, None)
     }
 
     fn new_with_bootstrap(
@@ -511,7 +525,35 @@ impl AppState {
     ) -> Self {
         let sessions = SessionManager::new(config.clone());
         sessions.start_idle_sweeper();
-        let http = gateway_http_client(config.response_timeout(), false);
+        let idle_read_timeout = config.response_timeout();
+        let mut state = Self::with_sessions_and_timeout(config, sessions, idle_read_timeout);
+        state.bootstrap_fingerprint = bootstrap_fingerprint;
+        state.bootstrap_challenge_key = bootstrap_challenge_key;
+        state.require_provider_client_token = require_provider_client_token;
+        state.bootstrap_shutdown = bootstrap_shutdown;
+        state.transparent_proxy_credential = transparent_proxy_credential;
+        state
+    }
+
+    /// Shares the daemon worker's sessions with the managed provider execution pipeline.
+    pub(crate) fn with_sessions(config: GatewayConfig, sessions: SessionManager) -> Self {
+        // Daemon delivery bounds response setup separately and never times out a live body.
+        Self::with_sessions_and_timeout(config, sessions, None)
+    }
+
+    fn with_sessions_and_timeout(
+        config: GatewayConfig,
+        sessions: SessionManager,
+        idle_read_timeout: Option<Duration>,
+    ) -> Self {
+        let http = gateway_http_client(idle_read_timeout, false, false);
+        let http_helper = if config.openai_api_key_helper.is_some()
+            || config.anthropic_api_key_helper.is_some()
+        {
+            gateway_http_client(idle_read_timeout, false, true)
+        } else {
+            http.clone()
+        };
         // A second client for destinations the caller named, which must not follow redirects.
         //
         // Validation applies to the URL that was named; a redirect names a different one, and
@@ -519,20 +561,23 @@ impl AppState {
         // here either -- it covers `Authorization` across origins, and provider keys travel in
         // `x-api-key` and friends, which are ordinary headers to it. So a validated `https`
         // endpoint could 307 a caller's provider key to any host, including over plain http.
-        let http_no_redirect = gateway_http_client(config.response_timeout(), true);
+        let http_no_redirect = gateway_http_client(idle_read_timeout, true, false);
         Self {
             config,
-            bootstrap_fingerprint,
-            bootstrap_challenge_key,
-            require_provider_client_token,
-            transparent_proxy_credential,
+            bootstrap_fingerprint: None,
+            bootstrap_challenge_key: None,
+            require_provider_client_token: false,
+            transparent_proxy_credential: None,
             http,
             http_no_redirect,
+            http_helper,
             sessions,
             last_activity: Arc::new(Mutex::new(Instant::now())),
-            bootstrap_shutdown,
+            active_websockets: Arc::new(AtomicUsize::new(0)),
+            bootstrap_shutdown: None,
             instance_id: uuid::Uuid::now_v7().to_string(),
             bootstrap_tls: None,
+            bootstrap_handshake_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_TLS_HANDSHAKES)),
             local_address: None,
         }
     }
@@ -543,10 +588,19 @@ impl AppState {
         }
     }
 
-    /// Authenticate an invocation-owned transparent client before interceptors can rewrite its
-    /// route. Foreground gateways retain their existing provider-credential behavior; managed
-    /// sidecars still require their stable client proof before ambient provider credentials may be
-    /// used.
+    pub(crate) fn hold_websocket(&self) -> WebSocketActivity {
+        self.active_websockets.fetch_add(1, Ordering::AcqRel);
+        WebSocketActivity(self.clone())
+    }
+
+    async fn has_open_activity(&self) -> bool {
+        self.active_websockets.load(Ordering::Acquire) != 0
+            || self.sessions.has_open_sessions().await
+    }
+
+    /// Authenticate transparent clients before interceptors can change the route.
+    /// Foreground gateways and managed sidecars require client proof before they use
+    /// provider credentials from the server. Requests can still use credentials sent by the client.
     pub(crate) fn authorize_provider_request(
         &self,
         headers: &mut HeaderMap,
@@ -679,14 +733,34 @@ impl AppState {
     }
 }
 
-fn gateway_http_client(idle_read_timeout: Option<Duration>, no_redirect: bool) -> Client {
-    let builder = Client::builder().connect_timeout(HTTP_CONNECT_TIMEOUT);
+fn gateway_http_client(
+    idle_read_timeout: Option<Duration>,
+    no_redirect: bool,
+    has_helpers: bool,
+) -> Client {
+    let builder = Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none());
     let builder = match idle_read_timeout {
         Some(timeout) => builder.read_timeout(timeout),
         None => builder,
     };
+    // Automatic redirects/retries would reuse a helper token without resolving another one.
+    let builder = if has_helpers {
+        builder
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+    } else {
+        builder
+    };
+    // The no-redirect client serves only caller-named destinations, so it is also the one that
+    // resolves through the named-upstream address policy.
     let builder = if no_redirect {
-        builder.redirect(reqwest::redirect::Policy::none())
+        builder
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(Arc::new(
+                crate::agents::pi::alignment::NamedUpstreamResolver::with_environment_proxies(),
+            ))
     } else {
         builder
     };
@@ -710,19 +784,127 @@ fn router_with_state(state: AppState) -> Router {
         .route("/v1/responses", post(gateway::passthrough))
         .route("/backend-api/codex/responses", post(gateway::passthrough))
         .route("/v1/chat/completions", post(gateway::passthrough))
-        .route("/v1/images/generations", post(gateway::images_generations))
+        .route("/responses/compact", post(gateway::unmanaged_passthrough))
+        .route(
+            "/v1/responses/compact",
+            post(gateway::unmanaged_passthrough),
+        )
+        .route(
+            "/backend-api/codex/responses/compact",
+            post(gateway::unmanaged_passthrough),
+        )
+        .route("/realtime/calls", post(gateway::unmanaged_passthrough))
+        .route("/v1/realtime/calls", post(gateway::unmanaged_passthrough))
+        .route(
+            "/backend-api/codex/realtime/calls",
+            post(gateway::unmanaged_passthrough),
+        )
+        .route("/images/edits", post(gateway::unmanaged_passthrough))
+        .route("/v1/images/edits", post(gateway::unmanaged_passthrough))
+        .route(
+            "/v1/nemo-relay/{capability}/images/edits",
+            post(gateway::unmanaged_passthrough),
+        )
+        .route(
+            "/memories/trace_summarize",
+            post(gateway::unmanaged_passthrough),
+        )
+        .route(
+            "/v1/memories/trace_summarize",
+            post(gateway::unmanaged_passthrough),
+        )
+        .route(
+            "/v1/nemo-relay/{capability}/memories/trace_summarize",
+            post(gateway::unmanaged_passthrough),
+        )
+        .route("/alpha/search", post(gateway::unmanaged_passthrough))
+        .route("/v1/alpha/search", post(gateway::unmanaged_passthrough))
+        .route(
+            "/v1/nemo-relay/{capability}/alpha/search",
+            post(gateway::unmanaged_passthrough),
+        )
+        .route("/live/{call_id}", get(gateway::websocket_passthrough))
+        .route("/v1/live/{call_id}", get(gateway::websocket_passthrough))
+        .route(
+            "/v1/nemo-relay/{capability}/live/{call_id}",
+            get(gateway::websocket_passthrough),
+        )
+        .route("/live/sessions", post(gateway::unmanaged_passthrough))
+        .route("/v1/live/sessions", post(gateway::unmanaged_passthrough))
+        .route(
+            "/live/sessions/{session_id}/attach",
+            get(gateway::websocket_passthrough),
+        )
+        .route(
+            "/v1/live/sessions/{session_id}/attach",
+            get(gateway::websocket_passthrough),
+        )
+        .route("/realtime", get(gateway::websocket_passthrough))
+        .route("/v1/realtime", get(gateway::websocket_passthrough))
+        .route(
+            "/live",
+            post(gateway::unmanaged_passthrough).get(gateway::websocket_passthrough),
+        )
+        .route(
+            "/v1/live",
+            post(gateway::unmanaged_passthrough).get(gateway::websocket_passthrough),
+        )
+        .route(
+            "/v1/images/generations",
+            post(gateway::unmanaged_passthrough),
+        )
         .route("/v1/messages", post(gateway::passthrough))
         .route("/v1/messages/count_tokens", post(gateway::passthrough))
         .route("/v1/models", get(gateway::models))
         .route(
             "/v1/nemo-relay/{capability}/images/generations",
-            post(gateway::images_generations),
+            post(gateway::unmanaged_passthrough),
+        )
+        .route(
+            "/v1/nemo-relay/{capability}/live",
+            post(gateway::unmanaged_passthrough).get(gateway::websocket_passthrough),
+        )
+        .route(
+            "/v1/nemo-relay/{capability}/responses/compact",
+            post(gateway::unmanaged_passthrough),
+        )
+        .route(
+            "/v1/nemo-relay/{capability}/realtime/calls",
+            post(gateway::unmanaged_passthrough),
+        )
+        .route(
+            "/v1/nemo-relay/{capability}/realtime",
+            get(gateway::websocket_passthrough),
+        )
+        .route(
+            "/v1/nemo-relay/{capability}/live/sessions",
+            post(gateway::unmanaged_passthrough),
+        )
+        .route(
+            "/v1/nemo-relay/{capability}/live/sessions/{session_id}/attach",
+            get(gateway::websocket_passthrough),
         )
         .route("/v1/nemo-relay/{capability}/models", get(gateway::models))
         .route(
             "/v1/nemo-relay/{capability}/{*provider_path}",
             post(gateway::passthrough),
         )
+        .method_not_allowed_fallback(|request: Request<Body>| async move {
+            crate::operational::unmatched_route(
+                "gateway",
+                request.method(),
+                request.uri(),
+                StatusCode::METHOD_NOT_ALLOWED,
+            )
+        })
+        .fallback(|request: Request<Body>| async move {
+            crate::operational::unmatched_route(
+                "gateway",
+                request.method(),
+                request.uri(),
+                StatusCode::NOT_FOUND,
+            )
+        })
         .layer(middleware::from_fn(responses_websocket_fallback))
         .layer(DefaultBodyLimit::max(max_hook_payload_bytes))
         .with_state(state)
@@ -771,15 +953,10 @@ async fn bootstrap_tls_tunnel(
     let Some(key) = state.bootstrap_challenge_key.as_ref() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let token_is_valid = headers
-        .get(BOOTSTRAP_CLIENT_TOKEN_HEADER)
+    if headers
+        .get(http::header::UPGRADE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|token| key.verify_client_token(token));
-    if !token_is_valid
-        || headers
-            .get(http::header::UPGRADE)
-            .and_then(|value| value.to_str().ok())
-            != Some("nemo-relay-tls")
+        != Some("nemo-relay-tls")
     {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -787,17 +964,31 @@ async fn bootstrap_tls_tunnel(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let proof = key.proof(fingerprint, nonce);
+    let Ok(handshake_permit) = Arc::clone(&state.bootstrap_handshake_permits).try_acquire_owned()
+    else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let proof = key.proof(
+        &crate::gateway::client::listener_fingerprint(
+            fingerprint,
+            local_address,
+            &state.instance_id,
+        ),
+        nonce,
+    );
     let upgrade = hyper::upgrade::on(&mut request);
     tokio::spawn(async move {
         let Ok(upgraded) = upgrade.await else {
             return;
         };
         let acceptor = tokio_rustls::TlsAcceptor::from(tls);
-        let Ok(mut encrypted) = acceptor
-            .accept(hyper_util::rt::TokioIo::new(upgraded))
-            .await
-        else {
+        let handshake = tokio::time::timeout(
+            TLS_HANDSHAKE_TIMEOUT,
+            acceptor.accept(hyper_util::rt::TokioIo::new(upgraded)),
+        )
+        .await;
+        drop(handshake_permit);
+        let Ok(Ok(mut encrypted)) = handshake else {
             return;
         };
         let Ok(mut local) = tokio::net::TcpStream::connect(local_address).await else {
@@ -810,6 +1001,7 @@ async fn bootstrap_tls_tunnel(
         .header(http::header::CONNECTION, "upgrade")
         .header(http::header::UPGRADE, "nemo-relay-tls")
         .header("x-nemo-relay-bootstrap-proof", proof)
+        .header("x-nemo-relay-instance-id", &state.instance_id)
         .header(http::header::CONTENT_LENGTH, "0")
         .body(Body::empty())
         .expect("bootstrap TLS upgrade response is valid")
@@ -863,19 +1055,28 @@ async fn healthz(State(state): State<AppState>, headers: HeaderMap) -> Response 
     let compatible = match presented_fingerprint {
         None => true,
         Some(fingerprint) => {
-            // Persistent configuration does not determine whether an existing
-            // gateway can serve this MCP connection. Bind the caller's
-            // fingerprint into the proof without requiring it to match the
-            // gateway's configuration fingerprint.
+            // Persistent and transparent clients can share a listener. Proofs bind the
+            // caller context to this actual listener and instance, never the Host header.
             let nonce = headers
                 .get("x-nemo-relay-bootstrap-nonce")
                 .and_then(|value| value.to_str().ok())
                 .filter(|nonce| {
                     nonce.len() == 64 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
                 });
-            match (nonce, state.bootstrap_challenge_key.as_ref()) {
-                (Some(nonce), Some(key)) => {
-                    let proof = key.proof(fingerprint, nonce);
+            match (
+                nonce,
+                state.bootstrap_challenge_key.as_ref(),
+                state.local_address,
+            ) {
+                (Some(nonce), Some(key), Some(address)) => {
+                    let proof = key.proof(
+                        &crate::gateway::client::listener_fingerprint(
+                            fingerprint,
+                            address,
+                            &state.instance_id,
+                        ),
+                        nonce,
+                    );
                     response_headers.insert(
                         "x-nemo-relay-bootstrap-proof",
                         HeaderValue::from_str(&proof).expect("bootstrap proof is an ASCII value"),
@@ -953,17 +1154,13 @@ fn plugin_idle_timeout() -> Result<Option<Duration>, CliError> {
     Ok(Some(Duration::from_secs(seconds)))
 }
 
-async fn idle_shutdown_future(
-    last_activity: Arc<Mutex<Instant>>,
-    sessions: SessionManager,
-    timeout: Duration,
-) {
+async fn idle_shutdown_future(state: AppState, timeout: Duration) {
     let tick = timeout
         .min(Duration::from_secs(5))
         .max(Duration::from_secs(1));
     loop {
         tokio::time::sleep(tick).await;
-        if idle_shutdown_ready(&last_activity, timeout, sessions.has_open_sessions()).await {
+        if idle_shutdown_ready(&state.last_activity, timeout, state.has_open_activity()).await {
             break;
         }
     }
@@ -1197,23 +1394,11 @@ async fn codex_hook(
         operational::hook_failed(&operational, "hook_server", error.log_kind(), true);
         return Err(error);
     }
-    if let Some(permission) = outcome.permission
-        && let Err(error) = authorize_hook_permission(&state, permission, &owner).await
-    {
-        if error.guardrail_rejection_reason().is_some() {
-            operational::hook_completed(&operational, "hook_server", "denied");
-        } else {
-            operational::hook_failed(&operational, "hook_server", error.log_kind(), true);
-        }
-        return Ok(Json(codex::permission_denial(permission_denial_reason(
-            error,
-        ))));
-    }
     operational::hook_completed(&operational, "hook_server", "completed");
     Ok(Json(outcome.response))
 }
 
-// Handles Claude Code hooks with the adapter's explicit continuation/permission response. Events
+// Handles Claude Code hooks with the adapter's explicit continuation response. Events
 // are committed before the response so Claude lifecycle hooks can close scopes deterministically.
 async fn claude_code_hook(
     State(state): State<AppState>,
@@ -1241,41 +1426,6 @@ async fn claude_code_hook(
         operational::hook_failed(&operational, "hook_server", error.log_kind(), true);
         return Err(error);
     }
-    if let Some(permission) = outcome.permission {
-        let result = authorize_hook_permission(&state, permission, &owner).await;
-        match &result {
-            Ok(()) => operational::hook_completed(&operational, "hook_server", "completed"),
-            Err(error) if error.guardrail_rejection_reason().is_some() => {
-                operational::hook_completed(&operational, "hook_server", "denied");
-            }
-            Err(error) => {
-                operational::hook_failed(&operational, "hook_server", error.log_kind(), true);
-            }
-        }
-        return Ok(Json(match result {
-            Ok(()) => serde_json::json!({
-                "continue": true,
-                "hookSpecificOutput": {
-                    "hookEventName": "PermissionRequest",
-                    "decision": {
-                        "behavior": "allow",
-                    }
-                }
-            }),
-            Err(error) => {
-                serde_json::json!({
-                    "continue": true,
-                    "hookSpecificOutput": {
-                        "hookEventName": "PermissionRequest",
-                        "decision": {
-                            "behavior": "deny",
-                            "message": permission_denial_reason(error),
-                        }
-                    }
-                })
-            }
-        }));
-    }
     operational::hook_completed(&operational, "hook_server", "completed");
     Ok(Json(outcome.response))
 }
@@ -1284,16 +1434,13 @@ async fn claude_code_hook(
 // Relay-authored extension rather than from pi itself. Events are committed before the response
 // so a conditional-execution guardrail rejection surfaces as HTTP 403 and the extension can turn
 // it into pi's `{block, reason}` before the tool runs.
-//
-// This is the one hook route that does not call `authorize_hook_request`. The extension posts from
-// inside pi's process, and on the standalone-daemon route nothing hands it a bootstrap or
-// transparent-proxy token, so requiring one here would break the documented setup. Closing that gap
-// means giving the extension a credential first; see `SessionManager::apply_events`.
+/// Authenticates pi lifecycle hooks and returns their policy verdict and argument rewrites.
 async fn pi_hook(
     State(state): State<AppState>,
     mut headers: HeaderMap,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, CliError> {
+    let owner = state.authorize_hook_request(&mut headers)?;
     state.touch();
     let operational = OperationalContext::take_from_headers(&mut headers);
     let Json(payload) = payload.map_err(|error| {
@@ -1306,7 +1453,11 @@ async fn pi_hook(
         .map(|event| operational.clone().with_session(event.session_id()))
         .unwrap_or(operational);
     operational::hook_started(&operational, "hook_server");
-    let effects = match state.sessions.apply_events(&headers, outcome.events).await {
+    let effects = match state
+        .sessions
+        .apply_authenticated_events_with_effects(&headers, outcome.events, &owner)
+        .await
+    {
         Ok(effects) => effects,
         Err(error) => {
             operational::hook_failed(&operational, "hook_server", error.log_kind(), true);
@@ -1319,29 +1470,6 @@ async fn pi_hook(
     // been, so an older extension keeps working unchanged.
     operational::hook_completed(&operational, "hook_server", "completed");
     Ok(Json(pi::response_with_effects(outcome.response, &effects)))
-}
-
-async fn authorize_hook_permission(
-    state: &AppState,
-    permission: Result<crate::events::ToolEvent, String>,
-    owner: &str,
-) -> Result<(), CliError> {
-    match permission {
-        Ok(permission) => {
-            state
-                .sessions
-                .authorize_tool_permission(&permission, owner)
-                .await
-        }
-        Err(reason) => Err(CliError::InvalidPayload(reason)),
-    }
-}
-
-fn permission_denial_reason(error: CliError) -> String {
-    error
-        .guardrail_rejection_reason()
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| error.to_string())
 }
 
 fn hook_payload_rejection(

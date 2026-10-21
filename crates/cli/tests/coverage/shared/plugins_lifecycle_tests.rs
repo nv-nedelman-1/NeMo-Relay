@@ -3493,7 +3493,7 @@ fn list_and_inspect_render_discovered_dynamic_plugins() {
         host_config: host_config_by_id.get("acme.guardrail"),
     }
     .to_string();
-    let inspect_value: serde_yaml::Value = serde_yaml::from_str(&inspect).unwrap();
+    let inspect_value: serde_json::Value = serde_saphyr::from_str(&inspect).unwrap();
     assert_eq!(
         inspect_value["metadata"]["id"].as_str(),
         Some("acme.guardrail")
@@ -4921,7 +4921,7 @@ fn inspect_redacts_host_config_values() {
     }
     .to_string();
     assert!(!inspect_output.contains("secret-token"));
-    let inspect_output: serde_yaml::Value = serde_yaml::from_str(&inspect_output).unwrap();
+    let inspect_output: serde_json::Value = serde_saphyr::from_str(&inspect_output).unwrap();
     assert_eq!(
         inspect_output["host_config"]["api_key"].as_str(),
         Some("<redacted>")
@@ -5001,14 +5001,14 @@ fn inspect_distinguishes_empty_host_config_from_missing_host_config() {
         host_config: host_config_by_id.get("acme.empty-config"),
     }
     .to_string();
-    let inspect_output: serde_yaml::Value = serde_yaml::from_str(&inspect_output).unwrap();
+    let inspect_output: serde_json::Value = serde_saphyr::from_str(&inspect_output).unwrap();
     assert_eq!(
         inspect_output["host_config_status"].as_str(),
         Some("present")
     );
     assert_eq!(
         inspect_output["host_config"]
-            .as_mapping()
+            .as_object()
             .expect("empty host config should render as an object")
             .len(),
         0
@@ -5358,4 +5358,114 @@ fn python_environment_snapshot_preserves_launchers_and_lib_alias_without_copying
         std::fs::read_to_string(external_python).unwrap(),
         "external interpreter"
     );
+}
+
+#[test]
+fn gateway_skips_optional_plugins_with_failed_integrity_or_attestation() {
+    let temp = tempfile::tempdir().unwrap();
+    let _env = EnvScope::hermetic(&temp);
+    let _cwd = CurrentDirGuard::enter(temp.path());
+    let server = GatewayOverrides::default();
+    for (plugin_id, native) in [("acme.trust-native", true), ("acme.trust-worker", false)] {
+        let plugin_dir = temp.path().join(plugin_id);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        if native {
+            write_native_dynamic_manifest(&plugin_dir, plugin_id);
+        } else {
+            write_dynamic_manifest(&plugin_dir, plugin_id);
+        }
+        add(
+            PluginsAddRequest {
+                scope: ConfigurationScope::User,
+                path: plugin_dir.clone(),
+            },
+            &server,
+        )
+        .unwrap();
+        enable(
+            PluginsEnableRequest {
+                id: plugin_id.into(),
+            },
+            &server,
+        )
+        .unwrap();
+        let mut resolved = resolve_plugins_config(None).unwrap();
+        allow_unsigned_test_plugins(&mut resolved);
+        assert_eq!(
+            active_dynamic_plugin_components(None, &resolved)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        resolved.dynamic_plugin_policy.defaults.attestation =
+            Some(nemo_relay::plugin::dynamic::DynamicPluginAttestationMode::SignatureRequired);
+        assert!(
+            active_dynamic_plugin_components(None, &resolved)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(enforce_required_dynamic_plugin_startup(None, &resolved).is_ok());
+
+        allow_unsigned_test_plugins(&mut resolved);
+        let artifact = if native {
+            "libfixture_native.so"
+        } else {
+            "plugin.py"
+        };
+        std::fs::write(plugin_dir.join(artifact), b"modified artifact").unwrap();
+        assert!(
+            active_dynamic_plugin_components(None, &resolved)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(enforce_required_dynamic_plugin_startup(None, &resolved).is_ok());
+
+        resolved.dynamic_plugin_policy.defaults.startup =
+            Some(nemo_relay::plugin::dynamic::DynamicPluginStartupClass::Required);
+        assert!(enforce_required_dynamic_plugin_startup(None, &resolved).is_err());
+    }
+}
+
+#[test]
+fn streamed_integrity_hashes_preserve_existing_digest_formats_and_snapshot_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("source");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("empty.bin"), []).unwrap();
+    let payload = vec![b'Z'; 3 * 64 * 1024 + 17];
+    let source = root.join("large.bin");
+    std::fs::write(&source, &payload).unwrap();
+    // These hashes use the old format. Empty files and files larger than one
+    // chunk must keep the same hashes so existing attestations stay valid.
+    let snapshot_digest = "1a09783296332b227ef7ed966085d214181f136f56bb59f8c937efa13c9ffd6b";
+    assert_eq!(snapshot_tree_digest(&root, false).unwrap(), snapshot_digest);
+    assert_eq!(
+        environment::environment_tree_digest(&root).unwrap(),
+        if cfg!(windows) {
+            "f67f5b5c51f9750b11b746c8a72a1aacc9d6785b91bb7c52ebcce13d91caab01"
+        } else {
+            "2db2539838ba8aff0a6f03268048dd9a0051b1902dd368f57f447f2155f2d092"
+        }
+    );
+
+    let mut closure = RuntimeClosureSources::default();
+    for name in ["empty.bin", "large.bin"] {
+        closure.files.insert(
+            PathBuf::from(name),
+            RuntimeClosureSource::File(root.join(name)),
+        );
+    }
+    assert_eq!(closure.digest().unwrap(), snapshot_digest);
+
+    let destination = temp.path().join("copied.bin");
+    copy_snapshot_regular_file(
+        &source,
+        &destination,
+        &mut HashMap::new(),
+        &mut SnapshotBudget::default(),
+        "test payload",
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(destination).unwrap(), payload);
 }

@@ -9,12 +9,13 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+#[cfg(test)]
+use axum::http::header::AUTHORIZATION;
+use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::serve::ListenerExt;
 use axum::{Json, Router};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnectionBuilder;
@@ -93,8 +94,8 @@ impl WorkerState {
         let data_token = registration.data_token_digest();
         Ok(Self {
             worker_id,
-            config,
             upstream: pooled_client().map_err(|error| CliError::Launch(error.to_string()))?,
+            config,
             managed,
             auth: RwLock::new(AuthTokens {
                 data: data_token,
@@ -348,14 +349,7 @@ pub(super) async fn serve(listener: TcpListener, options: RuntimeOptions) -> Res
     let server = async move {
         match tls_config {
             Some(config) => serve_tls(listener, app, config).await,
-            None => axum::serve(
-                listener.tap_io(|stream| {
-                    let _ = stream.set_nodelay(true);
-                }),
-                app,
-            )
-            .await
-            .map_err(CliError::Io),
+            None => serve_plain(listener, app).await,
         }
     };
     tokio::pin!(server);
@@ -437,6 +431,48 @@ pub(super) async fn serve(listener: TcpListener, options: RuntimeOptions) -> Res
     result
 }
 
+// Keep HTTP/2 settings identical for loopback and TLS workers. The connection window
+// is shared by every request stream, so the default 1 MiB can stall concurrent large uploads.
+pub(crate) fn worker_connection_builder() -> ConnectionBuilder<TokioExecutor> {
+    crate::daemon::common::transport::data_plane_connection_builder()
+}
+
+async fn serve_plain(listener: TcpListener, app: Router) -> Result<(), CliError> {
+    let accept_failure_limiter = LogRateLimiter::new(UPSTREAM_FAILURE_LOG_INTERVAL);
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                if let Some(suppressed_since_last_emit) = accept_failure_limiter.record() {
+                    log::warn!(
+                        target: "nemo_relay.daemon.worker",
+                        event = "worker_listener_accept_failed",
+                        suppressed_since_last_emit = suppressed_since_last_emit;
+                        "Worker listener accept failed: {error}"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let _ = stream.set_nodelay(true);
+        let service = app.clone();
+        connections.spawn(async move {
+            let mut builder = worker_connection_builder();
+            // Preserve axum::serve's HTTP/2 WebSocket support on the cleartext listener.
+            builder.http2().enable_connect_protocol();
+            let _ = builder
+                .serve_connection_with_upgrades(
+                    TokioIo::new(stream),
+                    TowerToHyperService::new(service),
+                )
+                .await;
+        });
+        while connections.try_join_next().is_some() {}
+    }
+}
+
 async fn serve_tls(
     listener: TcpListener,
     app: Router,
@@ -471,7 +507,7 @@ async fn serve_tls(
                 return;
             };
             drop(handshake_permit);
-            let builder = ConnectionBuilder::new(TokioExecutor::new());
+            let builder = worker_connection_builder();
             let _ = builder
                 .serve_connection_with_upgrades(
                     TokioIo::new(stream),
@@ -483,6 +519,15 @@ async fn serve_tls(
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn test_serve_tls(
+    listener: TcpListener,
+    app: Router,
+    config: Arc<rustls::ServerConfig>,
+) {
+    serve_tls(listener, app, config).await.unwrap();
+}
+
 fn router(state: Arc<WorkerState>) -> Router {
     let control = Router::new()
         .route(WORKER_PROBE_PATH, get(readiness_probe))
@@ -490,6 +535,14 @@ fn router(state: Arc<WorkerState>) -> Router {
     Router::new()
         .merge(control)
         .fallback(proxy)
+        .method_not_allowed_fallback(|request: Request<Body>| async move {
+            crate::operational::unmatched_route(
+                "worker",
+                request.method(),
+                request.uri(),
+                StatusCode::METHOD_NOT_ALLOWED,
+            )
+        })
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             authenticate_daemon_request,
@@ -612,10 +665,18 @@ fn drain_timeout_ms(request: &WorkerDrainRequest) -> u64 {
 }
 
 async fn proxy(State(state): State<Arc<WorkerState>>, request: Request<Body>) -> Response<Body> {
-    let Some(route) = PublicRoute::from_path(request.uri().path()) else {
-        return StatusCode::NOT_FOUND.into_response();
+    let Some(route) = PublicRoute::from_request(request.uri().path(), request.headers()) else {
+        return crate::operational::unmatched_route(
+            "worker",
+            request.method(),
+            request.uri(),
+            StatusCode::NOT_FOUND,
+        )
+        .into_response();
     };
-    let middleware = if matches!(route, PublicRoute::Provider(_)) {
+    let websocket = crate::gateway::websocket::supported_path(request.uri().path())
+        && crate::gateway::websocket::is_websocket(&request);
+    let middleware = if !websocket && matches!(route, PublicRoute::Provider(_)) {
         match state
             .managed
             .as_ref()
@@ -656,6 +717,9 @@ async fn proxy(State(state): State<Arc<WorkerState>>, request: Request<Body>) ->
             response
         }
         PublicRoute::Provider(provider) => {
+            if websocket {
+                return forward_to_provider(Arc::clone(&state), request, provider, in_flight).await;
+            }
             if let Some(managed) = state.managed.as_ref() {
                 let response = managed
                     .proxy_provider_with_requirements(
@@ -702,12 +766,16 @@ async fn forward_to_provider(
     route: ProviderRoute,
     in_flight: InFlight,
 ) -> Response<Body> {
-    let allow_environment_provider_auth =
-        crate::gateway::daemon_allows_environment_provider_auth(request.headers());
+    let allow_environment_provider_auth = crate::gateway::daemon_allows_provider_auth(
+        request.headers(),
+        request.uri().path(),
+        &state.config,
+    );
     let path_and_query = request
         .uri()
         .path_and_query()
         .map_or("/", |value| value.as_str());
+    let client_named = crate::gateway::daemon_destination_is_client_named(request.headers(), true);
     let destination = match crate::gateway::daemon_provider_upstream_url(
         request.headers(),
         path_and_query,
@@ -724,9 +792,36 @@ async fn forward_to_provider(
     ) {
         *request.headers_mut() = aligned;
     }
-    if allow_environment_provider_auth {
-        inject_provider_auth(request.headers_mut(), route, &state.config);
+    if allow_environment_provider_auth
+        && let Err(error) = inject_provider_auth(request.headers_mut(), route, &state.config).await
+    {
+        return error.into_response();
     }
+    let helper_auth = allow_environment_provider_auth
+        && crate::upstream_auth::helper(&state.config, matches!(route, ProviderRoute::Anthropic))
+            .is_some();
+    if crate::gateway::websocket::is_websocket(&request) {
+        let shutdown_state = Arc::clone(&state);
+        return match crate::gateway::websocket::forward_to_provider(
+            client_named,
+            helper_auth,
+            request,
+            &destination,
+            in_flight,
+            &state.config,
+            async move { shutdown_state.wait_until_stopped().await },
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => message(StatusCode::BAD_GATEWAY, &error.to_string()),
+        };
+    }
+    let upstream =
+        match crate::daemon::common::transport::provider_client(&state.upstream, helper_auth) {
+            Ok(client) => client,
+            Err(error) => return CliError::Launch(error.to_string()).into_response(),
+        };
     let destination = match destination.parse::<Uri>() {
         Ok(destination) => destination,
         Err(_) => {
@@ -744,11 +839,12 @@ async fn forward_to_provider(
         Ok(request) => request.map(box_body),
         Err(error) => return message(StatusCode::BAD_REQUEST, &error.to_string()),
     };
-    let response = match state
-        .config
-        .wait_for_response(state.upstream.request(request))
-        .await
-    {
+    let request =
+        match super::super::common::transport::request_provider(&upstream, client_named, request) {
+            Ok(request) => request,
+            Err(error) => return message(StatusCode::BAD_GATEWAY, &error.to_string()),
+        };
+    let response = match state.config.wait_for_response(request).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
             log_worker_upstream_request_failed(&state, route, "transport_error");
@@ -776,7 +872,12 @@ async fn forward_to_provider(
 
 fn managed_upstream_failure_reason(error: &CliError) -> Option<&'static str> {
     match error {
-        CliError::Upstream(_) => Some("transport_error"),
+        CliError::Upstream(_) | CliError::UpstreamTransport(_) => Some("transport_error"),
+        CliError::ProviderFailure(failure) => match failure.class {
+            nemo_relay::error::UpstreamFailureClass::Timeout => Some("response_head_timeout"),
+            nemo_relay::error::UpstreamFailureClass::Connection => Some("transport_error"),
+            _ => None,
+        },
         CliError::Io(_) => Some("io_error"),
         CliError::Http(_) => Some("invalid_response"),
         CliError::Launch(message) if message.contains("response-head timeout") => {
@@ -809,47 +910,18 @@ fn log_worker_upstream_request_failed(
     );
 }
 
-fn inject_provider_auth(headers: &mut HeaderMap, route: ProviderRoute, config: &GatewayConfig) {
-    if crate::provider_auth::has_provider_credential(headers) {
-        return;
-    }
-    let configured = match route {
-        ProviderRoute::OpenAi => config.openai_auth_header.as_deref(),
-        ProviderRoute::Anthropic => config.anthropic_auth_header.as_deref(),
-    };
-    if let Some(configured) = configured.and_then(header_value) {
-        headers.insert(AUTHORIZATION, configured);
-        return;
-    }
-    match route {
-        ProviderRoute::OpenAi => {
-            let Some(key) = nonempty_environment("OPENAI_API_KEY") else {
-                return;
-            };
-            if let Some(value) = header_value(&format!("Bearer {key}")) {
-                headers.insert(AUTHORIZATION, value);
-            }
-        }
-        ProviderRoute::Anthropic => {
-            let Some(key) = nonempty_environment("ANTHROPIC_API_KEY") else {
-                return;
-            };
-            if let Some(value) = header_value(&key) {
-                headers.insert(HeaderName::from_static("x-api-key"), value);
-            }
-        }
-    }
-}
-
-fn nonempty_environment(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-}
-
-fn header_value(value: &str) -> Option<HeaderValue> {
-    HeaderValue::from_str(value).ok()
+async fn inject_provider_auth(
+    headers: &mut HeaderMap,
+    route: ProviderRoute,
+    config: &GatewayConfig,
+) -> Result<(), CliError> {
+    crate::upstream_auth::apply(
+        headers,
+        matches!(route, ProviderRoute::Anthropic),
+        true,
+        config,
+    )
+    .await
 }
 
 fn begin_drain(state: &WorkerState, request: &WorkerDrainRequest) {

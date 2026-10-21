@@ -61,6 +61,8 @@ Public data types:
     RuntimeRegistrationIdentity: Structured identity of a runtime registration.
     ConditionalMiddlewareGuardrailHandle: Opaque handle for a registered guardrail.
     ScopeType: Semantic category for a Relay execution scope.
+    ScopeStackEntry: Scope UUID and semantic category in a detached snapshot.
+    ScopeStackSnapshot: Immutable root-to-top scope entries for an active binding.
     WorkerSdkError: SDK, host-call, or worker protocol error.
 
 Public callback aliases:
@@ -89,6 +91,7 @@ Public authoring types:
     LlmStreamNext: Continuation for a streaming LLM execution intercept.
 
 Public functions:
+    http_error_message: Format an upstream HTTP error status for forwarding.
     serve_plugin: Run a local ``grpc-v1`` worker until host shutdown.
 """
 
@@ -141,6 +144,8 @@ from ._api import (
     RuntimeRegistrationKind,
     RuntimeRegistrationOwner,
     RuntimeRegistrationOwnerKind,
+    ScopeStackEntry,
+    ScopeStackSnapshot,
     ScopeType,
     SubscriberCallback,
     ToolConditionalCallback,
@@ -155,6 +160,7 @@ from ._api import (
     WorkerRequestCodec,
     WorkerResponseCodec,
     WorkerSdkError,
+    http_error_message,
     serve_plugin,
 )
 
@@ -208,6 +214,8 @@ __all__ = [
     "RuntimeRegistrationOwnerKind",
     "PendingMarkSpec",
     "ScopeType",
+    "ScopeStackEntry",
+    "ScopeStackSnapshot",
     "SubscriberCallback",
     "ToolConditionalCallback",
     "ToolExecutionCallback",
@@ -221,5 +229,6 @@ __all__ = [
     "WorkerResponseCodec",
     "WorkerPlugin",
     "WorkerSdkError",
+    "http_error_message",
     "serve_plugin",
 ]

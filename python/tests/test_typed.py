@@ -211,29 +211,6 @@ class TestTypedHelpers:
             "labels": ["alpha", "beta"],
         }
 
-    def test_register_and_resolve_runtime_type(self) -> None:
-        token = typed._register_runtime_type(SearchArgs)
-        assert typed._resolve_runtime_type(token) is SearchArgs
-
-    def test_resolve_runtime_type_non_string(self) -> None:
-        assert typed._resolve_runtime_type(123) is None
-
-    def test_resolve_importable_type_success(self) -> None:
-        path = f"{SearchArgs.__module__}.{SearchArgs.__qualname__}"
-        assert typed._resolve_importable_type(path) is SearchArgs
-
-    def test_resolve_importable_type_invalid_inputs(self) -> None:
-        assert typed._resolve_importable_type("") is None
-        assert typed._resolve_importable_type(123) is None
-        assert typed._resolve_importable_type("does.not.exist.Type") is None
-
-    def test_resolve_importable_type_skips_local_classes(self) -> None:
-        class LocalType:
-            pass
-
-        path = f"{LocalType.__module__}.{LocalType.__qualname__}"
-        assert typed._resolve_importable_type(path) is None
-
 
 # ---------------------------------------------------------------------------
 # tool_execute tests
@@ -241,6 +218,36 @@ class TestTypedHelpers:
 
 
 class TestTypedToolExecute:
+    async def test_best_effort_tool_result_envelope_reaches_events(self, subscribed_events) -> None:
+        def execute(_args: Json) -> ToolExecutionResult[object]:
+            return ToolExecutionResult("answer", {"source": "test"})
+
+        outcome = await typed.tool_execute(
+            "best_effort_tool_result",
+            {},
+            execute,
+            JsonPassthrough(),
+            BestEffortAnyCodec(tool_result=True),
+        )
+        assert outcome.result == "answer"
+        assert outcome.annotation == {"source": "test"}
+        await subscribers.flush_async()
+        event = next(
+            event
+            for event in subscribed_events
+            if isinstance(event, ScopeEvent)
+            and event.name == "best_effort_tool_result"
+            and event.scope_category == "end"
+        )
+        assert event.data == {
+            "schema": "nemo.relay.tool_result@1",
+            "content": "answer",
+            "is_error": False,
+            "result": "answer",
+        }
+        assert event.category_profile is not None
+        assert event.category_profile["tool_result_annotation"] == {"source": "test"}
+
     async def test_dataclass_roundtrip(self) -> None:
         async def search(args: SearchArgs) -> ToolExecutionResult[SearchResult]:
             return ToolExecutionResult(SearchResult(items=[args.query], total=1), {"provider": "typed"})
@@ -774,6 +781,87 @@ class TestBestEffortAnyCodec:
         val = {"items": [1, "two", None, {"nested": True}]}
         assert self.codec.from_json(self.codec.to_json(val)) == val
 
+    @pytest.mark.parametrize(
+        ("value", "content"),
+        [
+            ("answer", "answer"),
+            ("", ""),
+            (
+                ["answer", {"type": "text", "text": "42"}],
+                [{"type": "text", "text": "answer"}, {"type": "text", "text": "42"}],
+            ),
+            ({"answer": 42, "status": "error"}, None),
+            ([1, 2], None),
+            (42, None),
+            (None, None),
+        ],
+    )
+    def test_tool_result_projection_and_legacy_decoding(self, value, content) -> None:
+        codec = BestEffortAnyCodec(tool_result=True)
+        encoded = cast(JsonObject, codec.to_json(value))
+        assert encoded["schema"] == "nemo.relay.tool_result@1"
+        assert encoded["content"] == content
+        assert encoded["is_error"] is False
+        assert encoded["result"] == value
+        # Either codec configuration accepts both legacy and enveloped input.
+        assert self.codec.from_json(encoded) == value
+        assert codec.from_json(encoded) == value
+        assert codec.from_json(self.codec.to_json(value)) == value
+
+    def test_tool_result_keeps_explicit_content_and_failure_status(self) -> None:
+        envelope = {
+            "schema": "nemo.relay.tool_result@1",
+            "content": "handled failure",
+            "is_error": True,
+            "result": {"native": "failure payload"},
+        }
+        codec = BestEffortAnyCodec(tool_result=True)
+        assert codec.to_json(envelope) == envelope
+        assert codec.from_json(envelope) == envelope["result"]
+
+    @pytest.mark.parametrize("allowed", [False, True])
+    def test_tool_result_preserves_type_allowlist(self, allowed: bool) -> None:
+        point = BEPoint(1, 2)
+        encoded = cast(JsonObject, BestEffortAnyCodec(tool_result=True).to_json(point))
+        assert encoded["content"] is None
+        codec = BestEffortAnyCodec(allowed_types=[BEPoint] if allowed else [])
+        restored = codec.from_json(encoded)
+        assert restored == (point if allowed else encoded["result"])
+
+    def test_tool_result_does_not_authorize_python_imports(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        marker = tmp_path / "import-marker"
+        module = tmp_path / "untrusted_tool_result.py"
+        module.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\nclass Payload: pass\n")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        payload = {"__nv_pydantic__": "untrusted_tool_result.Payload", "data": {}}
+        envelope = {
+            "schema": "nemo.relay.tool_result@1",
+            "content": "answer",
+            "is_error": False,
+            "result": payload,
+        }
+        assert self.codec.from_json(envelope) is payload
+        assert not marker.exists()
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"schema": "nemo.relay.tool_result@2"},
+            {"content": 42},
+            {"is_error": "true"},
+        ],
+    )
+    def test_unrecognized_tool_result_envelopes_remain_json(self, change) -> None:
+        envelope = {"schema": "nemo.relay.tool_result@1", "content": "answer", "is_error": False, "result": 42}
+        envelope.update(change)
+        assert self.codec.from_json(envelope) is envelope
+
+    @pytest.mark.parametrize("missing", ["content", "is_error", "result"])
+    def test_incomplete_tool_result_envelopes_remain_json(self, missing) -> None:
+        envelope = {"schema": "nemo.relay.tool_result@1", "content": "answer", "is_error": False, "result": 42}
+        del envelope[missing]
+        assert self.codec.from_json(envelope) is envelope
+
     # -- Round-trip: dataclass --
 
     def test_roundtrip_dataclass(self) -> None:
@@ -781,7 +869,7 @@ class TestBestEffortAnyCodec:
         encoded = self.codec.to_json(pt)
         assert isinstance(encoded, dict)
         assert "__nv_dataclass__" in encoded
-        restored = self.codec.from_json(encoded)
+        restored = BestEffortAnyCodec(allowed_types=[BEPoint]).from_json(encoded)
         assert isinstance(restored, BEPoint)
         assert restored == pt
 
@@ -795,7 +883,7 @@ class TestBestEffortAnyCodec:
         encoded = self.codec.to_json(pt)
         assert isinstance(encoded, dict)
         assert "__nv_dataclass__" in encoded
-        restored = self.codec.from_json(encoded)
+        restored = BestEffortAnyCodec(allowed_types=[LocalPoint]).from_json(encoded)
         assert isinstance(restored, LocalPoint)
         assert restored == pt
 
@@ -813,7 +901,7 @@ class TestBestEffortAnyCodec:
         assert isinstance(encoded, dict)
         assert "__nv_pydantic__" in encoded
         assert encoded["data"] == {"x": 3, "y": 4}
-        restored = self.codec.from_json(encoded)
+        restored = BestEffortAnyCodec(allowed_types=[PydPoint]).from_json(encoded)
         assert isinstance(restored, PydPoint)
         assert restored.x == 3
         assert restored.y == 4
@@ -876,26 +964,105 @@ class TestBestEffortAnyCodec:
     def test_from_json_empty_dict(self) -> None:
         assert self.codec.from_json({}) == {}
 
+    @pytest.mark.parametrize("tag", ["__nv_dataclass__", "__nv_pydantic__"])
+    @pytest.mark.parametrize("runtime_token", [None, "unregistered.Type:123", 123])
+    def test_unregistered_tags_do_not_import(
+        self, tag: str, runtime_token: object, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        marker = tmp_path / "import-marker"
+        module = tmp_path / "untrusted_codec_module.py"
+        module.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\nclass Payload: pass\n")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        data = {tag: "untrusted_codec_module.Payload", "__nv_runtime_type__": runtime_token, "data": {}}
+
+        assert self.codec.from_json(data) is data
+        assert not marker.exists()
+
+    @pytest.mark.parametrize("tag", ["__nv_dataclass__", "__nv_pydantic__"])
+    def test_unregistered_importable_types_do_not_construct(self, tag: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fail(*args, **kwargs):
+            pytest.fail("unregistered type must not be reconstructed")
+
+        cls = BEPoint if tag == "__nv_dataclass__" else BrokenValidatedModel
+        monkeypatch.setattr(cls, "__init__" if tag == "__nv_dataclass__" else "model_validate", fail)
+        data = {tag: f"{cls.__module__}.{cls.__qualname__}", "data": {"x": 1, "y": 2}}
+
+        assert self.codec.from_json(data) is data
+
+    @pytest.mark.parametrize("tag", ["__nv_dataclass__", "__nv_pydantic__"])
+    def test_encoding_does_not_authorize_reconstruction(self, tag: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        import pydantic
+
+        class Model(pydantic.BaseModel):
+            value: str
+
+        cls = BEPoint if tag == "__nv_dataclass__" else Model
+        value = BEPoint(1, 2) if tag == "__nv_dataclass__" else Model(value="original")
+        encoder = BestEffortAnyCodec(allowed_types=[cls])
+        encoded = cast(JsonObject, encoder.to_json(value))
+        # Simulate a copied token emitted by an older version of the codec.
+        encoded["__nv_runtime_type__"] = f"{cls.__module__}.{cls.__qualname__}:{id(cls)}"
+        encoded["data"] = {"x": 9, "y": 8} if tag == "__nv_dataclass__" else {"value": "modified"}
+
+        def fail(*args, **kwargs):
+            pytest.fail("encoding must not authorize constructors or validators")
+
+        monkeypatch.setattr(cls, "__init__" if tag == "__nv_dataclass__" else "model_validate", fail)
+        for codec in (self.codec, BestEffortAnyCodec(), BestEffortAnyCodec(allowed_types=[SearchArgs])):
+            assert codec.from_json(encoded) is encoded
+
+    def test_default_same_codec_roundtrip_remains_json(self) -> None:
+        encoded = self.codec.to_json(BEPoint(1, 2))
+        assert self.codec.from_json(encoded) is encoded
+
+    def test_allowlist_is_copied_and_does_not_allow_subclasses(self) -> None:
+        @dataclasses.dataclass
+        class ChildPoint(BEPoint):
+            pass
+
+        allowed = [BEPoint]
+        codec = BestEffortAnyCodec(allowed_types=allowed)
+        allowed.append(ChildPoint)
+        encoded = self.codec.to_json(ChildPoint(1, 2))
+        assert codec.from_json(encoded) is encoded
+        assert codec.from_json(self.codec.to_json(BEPoint(1, 2))) == BEPoint(1, 2)
+
+    def test_runtime_token_cannot_override_tag_allowlist(self) -> None:
+        encoded = cast(JsonObject, self.codec.to_json(BEPoint(1, 2)))
+        encoded["__nv_runtime_type__"] = f"{BEPoint.__module__}.{BEPoint.__qualname__}:{id(BEPoint)}"
+        encoded["__nv_dataclass__"] = "untrusted.Payload"
+        assert BestEffortAnyCodec(allowed_types=[BEPoint]).from_json(encoded) is encoded
+
+    def test_allowlist_rejects_non_class_entries(self) -> None:
+        with pytest.raises(TypeError, match="class objects"):
+            BestEffortAnyCodec(allowed_types=["untrusted.Payload"])  # type: ignore[list-item]
+
+    def test_allowlist_rejects_ambiguous_names(self) -> None:
+        first = dataclasses.make_dataclass("Payload", [("x", int)], namespace={"__module__": __name__})
+        second = dataclasses.make_dataclass("Payload", [("x", int)], namespace={"__module__": __name__})
+        with pytest.raises(ValueError, match="distinct classes"):
+            BestEffortAnyCodec(allowed_types=[first, second])
+
     def test_from_json_pydantic_validation_failure_returns_raw_dict(self) -> None:
         data = {
             "__nv_pydantic__": f"{BrokenValidatedModel.__module__}.{BrokenValidatedModel.__qualname__}",
             "data": {"x": 1},
         }
-        assert self.codec.from_json(data) == data
+        assert BestEffortAnyCodec(allowed_types=[BrokenValidatedModel]).from_json(data) == data
 
     def test_from_json_dataclass_reconstruction_failure_returns_raw_dict(self) -> None:
         data = {
             "__nv_dataclass__": f"{BEPoint.__module__}.{BEPoint.__qualname__}",
             "data": {"x": 1},
         }
-        assert self.codec.from_json(data) == data
+        assert BestEffortAnyCodec(allowed_types=[BEPoint]).from_json(data) == data
 
     def test_from_json_dataclass_with_non_mapping_payload_returns_raw_dict(self) -> None:
         data = {
             "__nv_dataclass__": f"{BEPoint.__module__}.{BEPoint.__qualname__}",
             "data": "not-a-mapping",
         }
-        assert self.codec.from_json(data) == data
+        assert BestEffortAnyCodec(allowed_types=[BEPoint]).from_json(data) == data
 
     def test_from_json_invalid_pickle_returns_raw_dict(self) -> None:
         data = {"__nv_pickle__": "broken.Type", "data": "not-base64"}
@@ -905,12 +1072,13 @@ class TestBestEffortAnyCodec:
         data = {"__nv_pickle__": "broken.Type", "data": {"not": "a-string"}}
         assert self.codec.from_json(data) == data
 
-    def test_from_json_pickle_rejects_callable_globals(self, tmp_path) -> None:
+    @pytest.mark.parametrize("allowed_types", [(), (PickleRceValue,)])
+    def test_from_json_pickle_rejects_callable_globals(self, tmp_path, allowed_types) -> None:
         marker = tmp_path / "pickle-rce-marker"
         payload = base64.b64encode(pickle.dumps(PickleRceValue(f"touch {marker}"))).decode("ascii")
         data = {"__nv_pickle__": "posix.system", "data": payload}
 
-        assert self.codec.from_json(data) == data
+        assert BestEffortAnyCodec(allowed_types=allowed_types).from_json(data) is data
         assert not marker.exists()
 
     def test_from_json_fallback_string_returns_string(self) -> None:

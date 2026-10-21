@@ -10,6 +10,7 @@
 
 use std::error::Error;
 use std::pin::Pin;
+use std::sync::{Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -34,6 +35,12 @@ pub(crate) type RelayBody = UnsyncBoxBody<Bytes, BoxError>;
 /// A pooled client supporting cleartext HTTP and rustls-backed HTTPS with HTTP/1.1 and HTTP/2.
 pub(crate) type PooledClient = Client<HttpsConnector<HttpConnector>, RelayBody>;
 
+/// A [`PooledClient`] that connects only where a client-named upstream may go.
+pub(crate) type NamedUpstreamClient = Client<
+    HttpsConnector<HttpConnector<crate::agents::pi::alignment::NamedUpstreamResolver>>,
+    RelayBody,
+>;
+
 /// A pooled cleartext client. The normal builder uses HTTP/1.1; the h2c builder uses HTTP/2 prior
 /// knowledge.
 #[cfg(test)]
@@ -41,6 +48,10 @@ pub(crate) type PooledHttpClient = Client<HttpConnector, RelayBody>;
 
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 256;
+// Larger DATA frames reduce framing and wakeup overhead for large provider bodies without
+// changing the pull-driven body adapter or its backpressure.
+pub(crate) const HTTP2_MAX_FRAME_BYTES: u32 = 64 * 1024;
+pub(crate) const DATA_PLANE_HTTP2_CONNECTION_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub(crate) enum TransportError {
@@ -48,6 +59,8 @@ pub(crate) enum TransportError {
     UnsupportedTunnel,
     #[error("forward destination must contain an HTTP or HTTPS scheme and an authority")]
     InvalidDestination,
+    #[error("plain HTTP upstreams are allowed only for loopback hosts; use https")]
+    InsecureDestination,
     #[error("invalid Connection header value")]
     InvalidConnectionHeader,
     #[error("forward destination authority is not a valid Host header")]
@@ -170,7 +183,7 @@ pub(crate) fn prepare_forward_request<B>(
             .parse::<std::net::IpAddr>()
             .is_ok_and(|address| address.is_loopback())
     {
-        return Err(TransportError::InvalidDestination);
+        return Err(TransportError::InsecureDestination);
     }
     let host = HeaderValue::from_str(authority.as_str()).map_err(TransportError::InvalidHost)?;
 
@@ -218,9 +231,45 @@ pub(crate) fn pooled_client() -> Result<PooledClient, TransportError> {
     // The workspace enables more than one rustls backend through unrelated integrations. Select
     // Relay's direct `ring` dependency before rustls tries to infer a process-wide provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let connector = pooled_connector()?;
+    let connector = pooled_connector(false)?;
     let builder = pooled_builder();
     Ok(builder.build(connector))
+}
+
+/// Use a separate pool only for requests whose helper credential was resolved at dispatch.
+pub(crate) fn provider_client(
+    upstream: &PooledClient,
+    helper_auth: bool,
+) -> Result<PooledClient, TransportError> {
+    if !helper_auth {
+        return Ok(upstream.clone());
+    }
+    helper_provider_client(false)
+}
+
+/// HTTP/1-only helper handshakes cannot retry with an already-resolved credential.
+pub(crate) fn helper_websocket_client() -> Result<PooledClient, TransportError> {
+    helper_provider_client(true)
+}
+
+fn helper_provider_client(http1_only: bool) -> Result<PooledClient, TransportError> {
+    static HTTP: OnceLock<PooledClient> = OnceLock::new();
+    static WEBSOCKET: OnceLock<PooledClient> = OnceLock::new();
+    static INITIALIZE: Mutex<()> = Mutex::new(());
+    let cell = if http1_only { &WEBSOCKET } else { &HTTP };
+    if let Some(client) = cell.get() {
+        return Ok(client.clone());
+    }
+    let _initializing = INITIALIZE.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(client) = cell.get() {
+        return Ok(client.clone());
+    }
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut builder = pooled_builder();
+    builder.retry_canceled_requests(false);
+    let client = builder.build(pooled_connector(http1_only)?);
+    let _ = cell.set(client.clone());
+    Ok(client)
 }
 
 /// Builds a pooled cleartext HTTP/1.1 client with persistent connections and `TCP_NODELAY`.
@@ -252,25 +301,111 @@ pub(crate) fn pooled_h2c_client() -> PooledHttpClient {
 /// Loopback workers selected by this client must support HTTP/2 without an Upgrade exchange.
 pub(crate) fn pooled_worker_h2c_client() -> Result<PooledClient, TransportError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let connector = pooled_connector()?;
+    let connector = pooled_connector(false)?;
     let mut builder = pooled_builder();
     builder.http2_only(true);
     Ok(builder.build(connector))
 }
 
-fn pooled_connector() -> Result<HttpsConnector<HttpConnector>, TransportError> {
-    let mut http = HttpConnector::new();
+/// Shares one HTTP/1-only pool and TLS root snapshot for RFC 6455 handshakes.
+pub(crate) fn pooled_websocket_client() -> Result<PooledClient, TransportError> {
+    static CLIENT: OnceLock<PooledClient> = OnceLock::new();
+    static INITIALIZE: Mutex<()> = Mutex::new(());
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    // Serialize successful initialization without caching a transient root-loading failure.
+    let _initializing = INITIALIZE.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = pooled_builder().build(pooled_connector(true)?);
+    Ok(CLIENT.get_or_init(|| client).clone())
+}
+
+/// The WebSocket pool for client-named upstreams; see [`named_upstream_pool`].
+pub(crate) fn named_upstream_websocket_client() -> Result<NamedUpstreamClient, TransportError> {
+    named_upstream_pool(true)
+}
+
+/// The HTTP pool for client-named upstreams; see [`named_upstream_pool`].
+pub(crate) fn named_upstream_client() -> Result<NamedUpstreamClient, TransportError> {
+    named_upstream_pool(false)
+}
+
+/// Sends a provider request through `configured`, or through the client-named upstream pool
+/// when the caller chose the destination.
+pub(crate) fn request_provider(
+    configured: &PooledClient,
+    client_named: bool,
+    request: Request<RelayBody>,
+) -> Result<hyper_util::client::legacy::ResponseFuture, TransportError> {
+    Ok(if client_named {
+        named_upstream_client()?.request(request)
+    } else {
+        configured.request(request)
+    })
+}
+
+/// Pools for client-named upstreams, which resolve through the named-upstream address policy.
+///
+/// Kept apart from the shared pools so a connection opened for a configured provider -- which
+/// an operator may legitimately place on a private network -- is never reused for a
+/// destination the caller chose.
+fn named_upstream_pool(http1_only: bool) -> Result<NamedUpstreamClient, TransportError> {
+    static HTTP: OnceLock<NamedUpstreamClient> = OnceLock::new();
+    static WEBSOCKET: OnceLock<NamedUpstreamClient> = OnceLock::new();
+    static INITIALIZE: Mutex<()> = Mutex::new(());
+    let cell = if http1_only { &WEBSOCKET } else { &HTTP };
+    if let Some(client) = cell.get() {
+        return Ok(client.clone());
+    }
+    let _initializing = INITIALIZE.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(client) = cell.get() {
+        return Ok(client.clone());
+    }
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let http = HttpConnector::new_with_resolver(
+        crate::agents::pi::alignment::NamedUpstreamResolver::default(),
+    );
+    let client = pooled_builder().build(pooled_connector_with(http, http1_only)?);
+    Ok(cell.get_or_init(|| client).clone())
+}
+
+fn pooled_connector(http1_only: bool) -> Result<HttpsConnector<HttpConnector>, TransportError> {
+    pooled_connector_with(HttpConnector::new(), http1_only)
+}
+
+fn pooled_connector_with<R>(
+    mut http: HttpConnector<R>,
+    http1_only: bool,
+) -> Result<HttpsConnector<HttpConnector<R>>, TransportError> {
     http.enforce_http(false);
     http.set_nodelay(true);
     http.set_connect_timeout(Some(CONNECT_TIMEOUT));
 
-    Ok(HttpsConnectorBuilder::new()
+    let builder = HttpsConnectorBuilder::new()
         .with_native_roots()
         .map_err(TransportError::NativeRoots)?
         .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .wrap_connector(http))
+        .enable_http1();
+    Ok(if http1_only {
+        builder.wrap_connector(http)
+    } else {
+        builder.enable_http2().wrap_connector(http)
+    })
+}
+
+/// Use the same bounded HTTP/2 receive settings on both daemon data-plane hops.
+pub(crate) fn data_plane_connection_builder()
+-> hyper_util::server::conn::auto::Builder<TokioExecutor> {
+    let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    builder
+        .http2()
+        .initial_connection_window_size(DATA_PLANE_HTTP2_CONNECTION_WINDOW_BYTES)
+        .max_frame_size(HTTP2_MAX_FRAME_BYTES);
+    builder
 }
 
 pub(crate) fn pooled_builder() -> hyper_util::client::legacy::Builder {
@@ -278,6 +413,7 @@ pub(crate) fn pooled_builder() -> hyper_util::client::legacy::Builder {
     builder.timer(TokioTimer::new());
     builder.pool_idle_timeout(Duration::from_secs(120));
     builder.pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST);
+    builder.http2_max_frame_size(HTTP2_MAX_FRAME_BYTES);
     builder.http2_keep_alive_interval(Duration::from_secs(15));
     builder.http2_keep_alive_timeout(Duration::from_secs(5));
     builder.http2_keep_alive_while_idle(true);

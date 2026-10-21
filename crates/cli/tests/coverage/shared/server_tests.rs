@@ -342,8 +342,13 @@ fn test_config() -> GatewayConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
         openai_base_url: "http://127.0.0.1".into(),
         openai_auth_header: None,
+        openai_api_key: None,
+        openai_api_key_helper: None,
         anthropic_base_url: "http://127.0.0.1".into(),
         anthropic_auth_header: None,
+        anthropic_api_key: None,
+        anthropic_api_key_helper: None,
+        chatgpt_codex_base_url: None,
         metadata: None,
         plugin_config: None,
         max_hook_payload_bytes: crate::configuration::DEFAULT_MAX_HOOK_PAYLOAD_BYTES,
@@ -378,7 +383,7 @@ async fn gateway_clients_allow_active_streams_past_the_idle_timeout() {
             socket.write_all(b"0\r\n\r\n").await.unwrap();
         });
 
-        let response = gateway_http_client(Some(Duration::from_millis(300)), no_redirect)
+        let response = gateway_http_client(Some(Duration::from_millis(300)), no_redirect, false)
             .get(format!("http://{address}"))
             .send()
             .await
@@ -417,11 +422,15 @@ async fn default_gateway_clients_allow_long_headers_and_silent_streams() {
             socket.write_all(b"done").await.unwrap();
         });
         let request = tokio::spawn(async move {
-            gateway_http_client(GatewayConfig::default().response_timeout(), no_redirect)
-                .get(format!("http://{address}"))
-                .send()
-                .await
-                .unwrap()
+            gateway_http_client(
+                GatewayConfig::default().response_timeout(),
+                no_redirect,
+                false,
+            )
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap()
         });
         tokio::time::timeout(Duration::from_secs(5), started_rx)
             .await
@@ -475,7 +484,7 @@ async fn gateway_clients_reject_stalled_streams_after_the_idle_timeout() {
             tokio::time::sleep(Duration::from_millis(500)).await;
         });
 
-        let response = gateway_http_client(Some(Duration::from_millis(200)), no_redirect)
+        let response = gateway_http_client(Some(Duration::from_millis(200)), no_redirect, false)
             .get(format!("http://{address}"))
             .send()
             .await
@@ -690,119 +699,6 @@ async fn codex_hook_keeps_codex_response_shape() {
 }
 
 #[tokio::test]
-async fn codex_permission_request_without_tool_call_id_requires_one_matching_active_tool() {
-    let app = router(test_config());
-    macro_rules! send_codex_hook {
-        ($payload:expr) => {{
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/hooks/codex")
-                        .header("content-type", "application/json")
-                        .body(Body::from($payload.to_string()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            serde_json::from_slice::<Value>(
-                &response.into_body().collect().await.unwrap().to_bytes(),
-            )
-            .unwrap()
-        }};
-    }
-
-    // Codex's documented shapes: PermissionRequest carries an approval `description` that the
-    // matching PreToolUse does not.
-    let permission = |session_id, command| {
-        json!({
-            "session_id": session_id,
-            "hook_event_name": "PermissionRequest",
-            "tool_name": "Bash",
-            "tool_input": {"command": command, "description": "needs approval"}
-        })
-    };
-    let pre_tool = |session_id, command| {
-        json!({
-            "session_id": session_id,
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
-            "tool_input": {"command": command}
-        })
-    };
-    let assert_denied = |body: Value| {
-        assert_eq!(body.as_object().map(|object| object.len()), Some(1));
-        let output = &body["hookSpecificOutput"];
-        assert_eq!(output["hookEventName"], json!("PermissionRequest"));
-        assert_eq!(output["decision"]["behavior"], json!("deny"));
-        assert!(
-            output["decision"]["message"]
-                .as_str()
-                .is_some_and(|message| !message.is_empty())
-        );
-    };
-
-    let single_match = "codex-permission-single-match";
-    for payload in [
-        json!({"session_id": single_match, "hook_event_name": "SessionStart"}),
-        pre_tool(single_match, "pwd"),
-        permission(single_match, "pwd"),
-    ] {
-        assert_eq!(send_codex_hook!(payload), json!({}));
-    }
-
-    let no_match = "codex-permission-no-match";
-    assert_eq!(
-        send_codex_hook!(json!({"session_id": no_match, "hook_event_name": "SessionStart"})),
-        json!({})
-    );
-    assert_eq!(send_codex_hook!(pre_tool(no_match, "pwd")), json!({}));
-    assert_denied(send_codex_hook!(permission(no_match, "whoami")));
-
-    let ambiguous = "codex-permission-ambiguous";
-    assert_eq!(
-        send_codex_hook!(json!({"session_id": ambiguous, "hook_event_name": "SessionStart"})),
-        json!({})
-    );
-    assert_eq!(send_codex_hook!(pre_tool(ambiguous, "pwd")), json!({}));
-    assert_eq!(send_codex_hook!(pre_tool(ambiguous, "pwd")), json!({}));
-    assert_denied(send_codex_hook!(permission(ambiguous, "pwd")));
-
-    let session_one = "codex-permission-session-one";
-    let session_two = "codex-permission-session-two";
-    assert_eq!(
-        send_codex_hook!(json!({"session_id": session_one, "hook_event_name": "SessionStart"})),
-        json!({})
-    );
-    assert_eq!(
-        send_codex_hook!(json!({"session_id": session_two, "hook_event_name": "SessionStart"})),
-        json!({})
-    );
-    assert_eq!(send_codex_hook!(pre_tool(session_two, "pwd")), json!({}));
-    assert_denied(send_codex_hook!(permission(session_one, "pwd")));
-
-    // MCP tools forward their real arguments, so a `description` argument must still match.
-    let mcp = "codex-permission-mcp-description";
-    let mcp_tool = |event| {
-        json!({
-            "session_id": mcp,
-            "hook_event_name": event,
-            "tool_name": "mcp__docs__create_page",
-            "tool_input": {"title": "Notes", "description": "page summary"}
-        })
-    };
-    for payload in [
-        json!({"session_id": mcp, "hook_event_name": "SessionStart"}),
-        mcp_tool("PreToolUse"),
-        mcp_tool("PermissionRequest"),
-    ] {
-        assert_eq!(send_codex_hook!(payload), json!({}));
-    }
-}
-
-#[tokio::test]
 async fn hook_operational_records_derive_session_tags_from_payloads_and_headers() {
     let app = router(test_config());
     let operation_id = "018f0f3f-3f7a-7b72-9d0d-e0d8ced91d8b";
@@ -929,14 +825,17 @@ async fn healthz_returns_ok() {
 #[tokio::test]
 async fn healthz_accepts_a_different_persistent_gateway_fingerprint() {
     let challenge_key = BootstrapChallengeKey::from_bytes(b"test challenge key");
-    let app = router_with_state(AppState::new_with_bootstrap(
+    let mut state = AppState::new_with_bootstrap(
         test_config(),
         Some("expected-fingerprint".into()),
         Some(challenge_key.clone()),
         false,
         None,
         None,
-    ));
+    );
+    state.local_address = Some("127.0.0.1:1".parse().unwrap());
+    let instance_id = state.instance_id.clone();
+    let app = router_with_state(state);
     let response = app
         .oneshot(
             Request::builder()
@@ -964,7 +863,11 @@ async fn healthz_accepts_a_different_persistent_gateway_fingerprint() {
             .unwrap(),
         challenge_key
             .proof(
-                "different-fingerprint",
+                &crate::gateway::client::listener_fingerprint(
+                    "different-fingerprint",
+                    "127.0.0.1:1".parse().unwrap(),
+                    &instance_id
+                ),
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             )
             .as_str()
@@ -1013,7 +916,7 @@ async fn healthz_rejects_a_missing_bootstrap_nonce() {
 }
 
 #[tokio::test]
-async fn bootstrap_tls_tunnel_requires_a_client_token_for_a_different_fingerprint() {
+async fn bootstrap_tls_tunnel_does_not_require_a_cleartext_credential() {
     let temp = tempfile::tempdir().unwrap();
     let _environment = EnvScope::set(&[
         ("XDG_CONFIG_HOME", Some(temp.path().as_os_str())),
@@ -1031,6 +934,9 @@ async fn bootstrap_tls_tunnel_requires_a_client_token_for_a_different_fingerprin
     );
     state.bootstrap_tls = Some(identity.server_config().unwrap());
     state.local_address = Some("127.0.0.1:1".parse().unwrap());
+    let permits = Arc::new(Semaphore::new(1));
+    state.bootstrap_handshake_permits = Arc::clone(&permits);
+    let instance_id = state.instance_id.clone();
     let app = router_with_state(state);
     let nonce = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1049,7 +955,9 @@ async fn bootstrap_tls_tunnel_requires_a_client_token_for_a_different_fingerprin
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    // In-process requests have no transport to upgrade; that error releases the slot.
+    wait_for_bootstrap_handshake_slot(&permits).await;
 
     let response = app
         .oneshot(
@@ -1075,12 +983,137 @@ async fn bootstrap_tls_tunnel_requires_a_client_token_for_a_different_fingerprin
             .headers()
             .get("x-nemo-relay-bootstrap-proof")
             .unwrap(),
-        key.proof("caller-fingerprint", nonce).as_str()
+        key.proof(
+            &crate::gateway::client::listener_fingerprint(
+                "caller-fingerprint",
+                "127.0.0.1:1".parse().unwrap(),
+                &instance_id
+            ),
+            nonce
+        )
+        .as_str()
     );
 }
 
+/// Read only the HTTP headers so TLS bytes remain available to the connector.
+async fn read_bootstrap_response_head(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> String {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.unwrap());
+            assert!(head.len() < 16 * 1024);
+        }
+        String::from_utf8(head).unwrap()
+    })
+    .await
+    .expect("server returns response headers")
+}
+
+/// Exercise the foreground tunnel through a real HTTP upgrade.
+async fn open_bootstrap_test_tunnel(address: SocketAddr) -> (tokio::net::TcpStream, String) {
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    stream.write_all(format!(
+        "GET /bootstrap/tunnel HTTP/1.1\r\nHost: {address}\r\nConnection: upgrade\r\nUpgrade: nemo-relay-tls\r\nx-nemo-relay-bootstrap-fingerprint: test\r\nx-nemo-relay-bootstrap-nonce: {}\r\n\r\n",
+        "a".repeat(64)
+    ).as_bytes()).await.unwrap();
+    let response = read_bootstrap_response_head(&mut stream).await;
+    (stream, response)
+}
+
+/// Wait for the handshake task to release its admission slot.
+async fn wait_for_bootstrap_handshake_slot(permits: &Semaphore) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while permits.available_permits() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("handshake slot is released");
+}
+
 #[tokio::test]
-async fn managed_sidecar_requires_private_client_proof_for_forwarded_credentials() {
+async fn bootstrap_tls_tunnel_limits_handshakes_and_recovers_after_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let _environment = EnvScope::set(&[
+        ("XDG_CONFIG_HOME", Some(temp.path().as_os_str())),
+        ("HOME", Some(temp.path().as_os_str())),
+    ]);
+    let identity = RelayTlsIdentity::load_or_create().unwrap();
+    let mut state = AppState::new_with_bootstrap(
+        test_config(),
+        Some("test".into()),
+        Some(BootstrapChallengeKey::from_bytes(b"test key")),
+        false,
+        None,
+        None,
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    state.local_address = Some(address);
+    state.bootstrap_tls = Some(identity.server_config().unwrap());
+    let permits = Arc::new(Semaphore::new(1));
+    state.bootstrap_handshake_permits = Arc::clone(&permits);
+    let app = router_with_state(state);
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (mut idle, response) = open_bootstrap_test_tunnel(address).await;
+    assert!(response.starts_with("HTTP/1.1 101"), "{response}");
+    let (_excess, response) = open_bootstrap_test_tunnel(address).await;
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    // An idle client is disconnected by the production handshake timeout.
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(
+            TLS_HANDSHAKE_TIMEOUT + Duration::from_secs(5),
+            idle.read(&mut byte)
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        0
+    );
+    wait_for_bootstrap_handshake_slot(&permits).await;
+
+    let (mut malformed, response) = open_bootstrap_test_tunnel(address).await;
+    assert!(response.starts_with("HTTP/1.1 101"), "{response}");
+    malformed.write_all(b"invalid TLS header").await.unwrap();
+    wait_for_bootstrap_handshake_slot(&permits).await;
+
+    let (stream, response) = open_bootstrap_test_tunnel(address).await;
+    assert!(response.starts_with("HTTP/1.1 101"), "{response}");
+    let connector = tokio_rustls::TlsConnector::from(identity.client_config().unwrap());
+    let mut encrypted = tokio::time::timeout(
+        Duration::from_secs(5),
+        connector.connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            stream,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    wait_for_bootstrap_handshake_slot(&permits).await;
+    encrypted
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    assert!(
+        read_bootstrap_response_head(&mut encrypted)
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    // Established tunnels must not consume handshake slots.
+    let (pending, response) = open_bootstrap_test_tunnel(address).await;
+    assert!(response.starts_with("HTTP/1.1 101"), "{response}");
+    drop(pending);
+    wait_for_bootstrap_handshake_slot(&permits).await;
+    drop(encrypted);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn gateways_require_private_client_proof_for_forwarded_credentials() {
     let key = BootstrapChallengeKey::from_bytes(b"test challenge key");
     let state = AppState::new_with_bootstrap(
         test_config(),
@@ -1123,7 +1156,7 @@ async fn managed_sidecar_requires_private_client_proof_for_forwarded_credentials
 
     let foreground = AppState::new(test_config());
     assert!(
-        foreground
+        !foreground
             .authorize_provider_request(&mut HeaderMap::new(), "/v1/responses")
             .unwrap()
             .0
@@ -1131,9 +1164,9 @@ async fn managed_sidecar_requires_private_client_proof_for_forwarded_credentials
     );
 
     let explicit_daemon =
-        AppState::new_with_bootstrap(test_config(), None, Some(key.clone()), false, None, None);
+        AppState::new_with_bootstrap(test_config(), None, Some(key.clone()), true, None, None);
     assert!(
-        explicit_daemon
+        !explicit_daemon
             .authorize_provider_request(&mut HeaderMap::new(), "/v1/responses")
             .unwrap()
             .0
@@ -1166,6 +1199,86 @@ async fn managed_sidecar_requires_private_client_proof_for_forwarded_credentials
         !transparent_headers
             .contains_key(crate::provider_auth::TRANSPARENT_PROXY_CREDENTIAL_HEADER)
     );
+}
+
+#[tokio::test]
+async fn foreground_listener_requires_client_proof_before_lending_provider_credentials() {
+    use crate::gateway::websocket::tests::serve;
+    let temp = tempfile::tempdir().unwrap();
+    let _environment = EnvScope::set(&[
+        ("XDG_CONFIG_HOME", Some(temp.path().as_os_str())),
+        ("HOME", Some(temp.path().as_os_str())),
+        (
+            "OPENAI_API_KEY",
+            Some(std::ffi::OsStr::new("foreground-env-secret")),
+        ),
+    ]);
+    let key = BootstrapChallengeKey::load().unwrap();
+    for configured in [None, Some("Bearer configured-provider")] {
+        let captured = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
+        let recorder = Arc::clone(&captured);
+        let upstream_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    recorder.lock().unwrap().push(headers);
+                    Json(completion_body("provider answered"))
+                }
+            }),
+        );
+        let (upstream_url, upstream_task) = serve(upstream_app).await;
+        let mut config = test_config();
+        config.openai_base_url = format!("{upstream_url}/v1");
+        config.openai_auth_header = configured.map(str::to_owned);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(serve_listener(listener, config, Some(shutdown_rx)));
+        let client = reqwest::Client::new();
+        for (token, caller_auth, expected) in [
+            (None, None, None),
+            (Some("hmac-sha256:wrong".to_string()), None, None),
+            (
+                Some(key.client_token()),
+                None,
+                Some(configured.unwrap_or("Bearer foreground-env-secret")),
+            ),
+            (
+                None,
+                Some("Bearer caller-owned"),
+                Some("Bearer caller-owned"),
+            ),
+        ] {
+            let mut request = client.post(&url).json(&json!({
+                "model": "nvidia/nemotron-test",
+                "messages": [{"role": "user", "content": "hi"}]
+            }));
+            if let Some(token) = token {
+                request = request.header(BOOTSTRAP_CLIENT_TOKEN_HEADER, token);
+            }
+            if let Some(auth) = caller_auth {
+                request = request.header(header::AUTHORIZATION, auth);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.bytes().await.unwrap();
+            let headers = captured.lock().unwrap().last().unwrap().clone();
+            assert_eq!(
+                headers
+                    .get(header::AUTHORIZATION)
+                    .map(|v| v.to_str().unwrap()),
+                expected
+            );
+            assert!(!headers.contains_key(BOOTSTRAP_CLIENT_TOKEN_HEADER));
+        }
+        shutdown_tx.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        upstream_task.abort();
+    }
 }
 
 #[tokio::test]
@@ -1343,7 +1456,7 @@ async fn explicit_daemon_hook_authentication_is_internal_and_rejects_bad_tokens(
 #[tokio::test]
 async fn healthz_only_refreshes_idle_activity_for_an_authenticated_heartbeat() {
     let challenge_key = BootstrapChallengeKey::from_bytes(b"test challenge key");
-    let state = AppState::new_with_bootstrap(
+    let mut state = AppState::new_with_bootstrap(
         test_config(),
         Some("expected-fingerprint".into()),
         Some(challenge_key.clone()),
@@ -1354,6 +1467,8 @@ async fn healthz_only_refreshes_idle_activity_for_an_authenticated_heartbeat() {
     let activity = state.last_activity.clone();
     let baseline = std::time::Instant::now() - Duration::from_secs(30);
     *activity.lock().unwrap() = baseline;
+    state.local_address = Some("127.0.0.1:1".parse().unwrap());
+    let instance_id = state.instance_id.clone();
     let app = router_with_state(state);
 
     for fingerprint in [
@@ -1397,7 +1512,11 @@ async fn healthz_only_refreshes_idle_activity_for_an_authenticated_heartbeat() {
             .unwrap(),
         challenge_key
             .proof(
-                "expected-fingerprint",
+                &crate::gateway::client::listener_fingerprint(
+                    "expected-fingerprint",
+                    "127.0.0.1:1".parse().unwrap(),
+                    &instance_id
+                ),
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             )
             .as_str()
@@ -3067,211 +3186,6 @@ async fn claude_code_hook_returns_continue_shape() {
 }
 
 #[tokio::test]
-async fn gateway_permission_requests_emit_policy_marks() {
-    const SUBSCRIBER: &str = "gateway-permission-audit";
-    let _guard = PLUGIN_CONFIG_TEST_LOCK.lock().await;
-    let _ = deregister_subscriber(SUBSCRIBER);
-    let app = router(test_config());
-    let captured = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
-    let events = Arc::clone(&captured);
-    register_subscriber(
-        SUBSCRIBER,
-        Arc::new(move |event| {
-            if event
-                .metadata()
-                .and_then(|metadata| metadata.get("session_id"))
-                .or_else(|| event.data().and_then(|data| data.get("session_id")))
-                .and_then(Value::as_str)
-                .is_some_and(|session| session.starts_with("gateway-permission-audit"))
-                && matches!(
-                    event.name(),
-                    "hook_mark" | "nemo_relay.permission.policy_decision"
-                )
-            {
-                events.lock().unwrap().push(json!({
-                    "name": event.name(),
-                    "data": event.data(),
-                    "metadata": event.metadata(),
-                }));
-            }
-        }),
-    )
-    .unwrap();
-    let _subscriber_cleanup = SubscriberCleanup(SUBSCRIBER);
-
-    let session_id = "gateway-permission-audit-codex";
-    for event_name in ["PreToolUse", "PermissionRequest"] {
-        let mut payload = json!({
-            "session_id": session_id,
-            "hook_event_name": event_name,
-            "permission_mode": "default",
-            "tool_use_id": "audit-tool-1",
-            "tool_name": "Bash",
-            "tool_input": {"command": "pwd"},
-        });
-        if event_name == "PermissionRequest" {
-            payload.as_object_mut().unwrap().remove("tool_use_id");
-        }
-        let response = app
-            .clone()
-            .oneshot(
-                Request::post("/hooks/codex")
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: Value =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        if event_name == "PermissionRequest" {
-            assert_eq!(body, json!({}));
-        }
-    }
-    flush_subscribers().unwrap();
-    let events = captured.lock().unwrap();
-    let marks: Vec<_> = events
-        .iter()
-        .filter(|event| {
-            event["name"] == "nemo_relay.permission.policy_decision"
-                && event["metadata"]["session_id"] == session_id
-        })
-        .collect();
-    assert_eq!(marks.len(), 1);
-    assert!(marks[0]["data"].get("decision").is_none());
-    assert_eq!(marks[0]["data"]["policy_outcome"], "pass");
-    assert_eq!(marks[0]["data"]["decision_source"], "nemo_relay");
-    assert_eq!(marks[0]["data"]["tool_call_id"], "audit-tool-1");
-    assert_eq!(marks[0]["data"]["harness_permission_mode"], "default");
-    assert!(events.iter().any(|event| {
-        event["name"] == "hook_mark"
-            && event["data"]["session_id"] == session_id
-            && event["data"]["permission_mode"] == "default"
-    }));
-    assert!(deregister_subscriber(SUBSCRIBER).unwrap());
-}
-
-#[tokio::test]
-async fn claude_permission_request_allows_an_exact_active_tool() {
-    let app = router(test_config());
-    let pre_tool = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/hooks/claude-code")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "session_id": "claude-permission",
-                        "hook_event_name": "PreToolUse",
-                        "tool_use_id": "tool-1",
-                        "tool_name": "Read",
-                        "tool_input": {"file_path": "README.md"}
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(pre_tool.status(), StatusCode::OK);
-    let bytes = pre_tool.into_body().collect().await.unwrap().to_bytes();
-    let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body, json!({"continue": true}));
-
-    let permission = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/hooks/claude-code")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "session_id": "claude-permission",
-                        "hook_event_name": "PermissionRequest",
-                        "tool_name": "Read",
-                        "tool_input": {"file_path": "README.md"}
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(permission.status(), StatusCode::OK);
-    let bytes = permission.into_body().collect().await.unwrap().to_bytes();
-    let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(
-        body["hookSpecificOutput"]["hookEventName"],
-        json!("PermissionRequest")
-    );
-    assert_eq!(
-        body["hookSpecificOutput"]["decision"]["behavior"],
-        json!("allow")
-    );
-
-    let second_pre_tool = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/hooks/claude-code")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "session_id": "claude-permission",
-                        "hook_event_name": "PreToolUse",
-                        "tool_use_id": "tool-2",
-                        "tool_name": "Read",
-                        "tool_input": {"file_path": "README.md"}
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(second_pre_tool.status(), StatusCode::OK);
-
-    let ambiguous = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/hooks/claude-code")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "session_id": "claude-permission",
-                        "hook_event_name": "PermissionRequest",
-                        "tool_name": "Read",
-                        "tool_input": {"file_path": "README.md"}
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(ambiguous.status(), StatusCode::OK);
-    let bytes = ambiguous.into_body().collect().await.unwrap().to_bytes();
-    let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(
-        body["hookSpecificOutput"]["decision"]["behavior"],
-        json!("deny")
-    );
-    assert!(
-        body["hookSpecificOutput"]["decision"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("does not match")
-    );
-}
-
-#[tokio::test]
 async fn pre_tool_hook_rejects_when_conditional_guardrail_blocks() {
     let _guard = PLUGIN_CONFIG_TEST_LOCK.lock().await;
     let _ = deregister_tool_conditional_execution_guardrail("cli-pre-tool-blocker");
@@ -3288,36 +3202,38 @@ async fn pre_tool_hook_rejects_when_conditional_guardrail_blocks() {
     .unwrap();
     let _cleanup = ToolGuardrailCleanup("cli-pre-tool-blocker");
 
-    let app = router(test_config());
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/hooks/claude-code")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "session_id": "guardrail-session",
-                        "hook_event_name": "PreToolUse",
-                        "tool_use_id": "tool-1",
-                        "tool_name": BLOCKED_TEST_TOOL,
-                        "tool_input": { "command": "rm -rf /tmp/demo" }
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    for path in ["/hooks/claude-code", "/hooks/codex"] {
+        let app = router(test_config());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "session_id": "guardrail-session",
+                            "hook_event_name": "PreToolUse",
+                            "tool_use_id": "tool-1",
+                            "tool_name": BLOCKED_TEST_TOOL,
+                            "tool_input": { "command": "rm -rf /tmp/demo" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(
-        body["error"]["type"],
-        json!("nemo_relay_guardrail_rejected")
-    );
-    assert_eq!(body["error"]["reason"], json!("blocked by policy"));
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"]["type"],
+            json!("nemo_relay_guardrail_rejected")
+        );
+        assert_eq!(body["error"]["reason"], json!("blocked by policy"));
+    }
 }
 
 // pi's extension gates a tool call on this endpoint's verdict, so the 403 shape
@@ -4200,6 +4116,66 @@ async fn gateway_preserves_streaming_body() {
         created_idx < completed_idx,
         "events out of order: {body_str}"
     );
+}
+
+/// A clean upstream EOF still fails if the Responses stream has no final event.
+#[tokio::test]
+async fn gateway_rejects_responses_streams_without_final_events() {
+    for body in [
+        "",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"early\"}}\n\n",
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/v1/responses",
+                post(move || async move { ([(header::CONTENT_TYPE, "text/event-stream")], body) }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = test_config();
+        config.openai_base_url = format!("http://{address}");
+        let response = router(config)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-test", "input": "hello", "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut response_body = response.into_body();
+        if !body.is_empty() {
+            let first = response_body
+                .frame()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_data()
+                .unwrap();
+            assert!(
+                std::str::from_utf8(&first)
+                    .unwrap()
+                    .contains("response.created")
+            );
+        }
+        let error = response_body.frame().await.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("stream ended before its final response event")
+        );
+        handle.abort();
+    }
 }
 
 #[tokio::test]
@@ -6570,6 +6546,772 @@ async fn a_named_upstream_redirect_is_not_followed() {
         StatusCode::TEMPORARY_REDIRECT,
         "the redirect is surfaced to the caller rather than followed"
     );
+    assert!(!response.headers().contains_key(header::LOCATION));
 
     redirector.abort();
+}
+
+#[tokio::test]
+async fn unmanaged_provider_routes_preserve_wire_bodies_and_response_headers() {
+    async fn echo(request: Request<Body>) -> Response<Body> {
+        assert_eq!(request.uri().query(), Some("model=voice"));
+        assert_eq!(
+            request.headers()["authorization"],
+            "Bearer caller-voice-key"
+        );
+        let upstream_path = request.uri().path().to_string();
+        let content_type = request.headers()["content-type"].clone();
+        let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        Response::builder()
+            .status(StatusCode::CREATED)
+            .header("content-type", content_type)
+            .header("location", "/v1/live/rtc_test")
+            .header("x-upstream-path", upstream_path)
+            .body(Body::from(body))
+            .unwrap()
+    }
+    let provider = Router::new()
+        .route("/v1/live", post(echo))
+        .route("/v1/realtime/calls", post(echo))
+        .route("/v1/responses/compact", post(echo));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let provider_task = tokio::spawn(async move { axum::serve(listener, provider).await.unwrap() });
+    let mut config = test_config();
+    config.openai_base_url = format!("http://{address}/v1");
+    let state = AppState::new(config);
+    let app = router_with_state(state.clone());
+    for (path, upstream_path) in [
+        ("/live", "/v1/live"),
+        ("/v1/live", "/v1/live"),
+        ("/realtime/calls", "/v1/realtime/calls"),
+        ("/v1/realtime/calls", "/v1/realtime/calls"),
+        ("/backend-api/codex/realtime/calls", "/v1/realtime/calls"),
+        ("/responses/compact", "/v1/responses/compact"),
+        ("/v1/responses/compact", "/v1/responses/compact"),
+        (
+            "/backend-api/codex/responses/compact",
+            "/v1/responses/compact",
+        ),
+    ] {
+        for (content_type, body) in [
+            ("application/sdp", "v=0\r\no=voice offer\r\n"),
+            (
+                "multipart/form-data; boundary=voice",
+                "--voice\r\nContent-Disposition: form-data; name=\"sdp\"\r\n\r\nv=0\r\n--voice--\r\n",
+            ),
+            (
+                "application/json",
+                "{ \"sdp\": \"v=0\\r\\n\", \"session\": {} }",
+            ),
+        ] {
+            if path.ends_with("/compact") && content_type != "application/json" {
+                continue;
+            }
+            let body = if path.ends_with("/compact") {
+                "{ \"model\": \"gpt-test\", \"input\": [], \"encrypted_content\": \"opaque\" }"
+            } else {
+                body
+            };
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(format!("{path}?model=voice"))
+                        .header("content-type", content_type)
+                        .header("authorization", "Bearer caller-voice-key")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            assert_eq!(response.headers()["content-type"], content_type);
+            assert_eq!(response.headers()["x-upstream-path"], upstream_path);
+            assert_eq!(response.headers()["location"], "/v1/live/rtc_test");
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                body
+            );
+        }
+    }
+    assert!(!state.sessions.has_open_sessions().await);
+    provider_task.abort();
+}
+
+#[tokio::test]
+async fn sideband_capability_routes_authenticate_and_attach_existing_sessions() {
+    use crate::gateway::websocket::tests::{
+        exercise_sideband, exercise_unmanaged_http, provider, serve,
+    };
+    let (upstream, provider_task, active) = provider().await;
+    let key = BootstrapChallengeKey::from_bytes(b"sideband capability");
+    let mut config = test_config();
+    config.openai_base_url = upstream;
+    let (origin, task) = serve(router_with_state(AppState::new_with_bootstrap(
+        config,
+        Some("sideband-fingerprint".into()),
+        Some(key.clone()),
+        true,
+        None,
+        None,
+    )))
+    .await;
+    let capability_origin = format!("{origin}/v1/nemo-relay/{}", key.client_token());
+    exercise_unmanaged_http(&capability_origin, None, &[""]).await;
+    exercise_sideband(&capability_origin, None, &active, &[""]).await;
+    let url = format!(
+        "{}/v1/nemo-relay/invalid/live/sessions/live_0/attach",
+        origin.replacen("http", "ws", 1)
+    );
+    let error = tokio_tungstenite::connect_async(url).await.unwrap_err();
+    let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+        panic!("{error}");
+    };
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    task.abort();
+    provider_task.abort();
+}
+
+#[tokio::test]
+async fn websocket_named_upstream_requires_proxy_auth_and_preserves_provider_credentials() {
+    use crate::gateway::websocket::tests::{provider, serve};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let (upstream, provider_task, active) = provider().await;
+    let mut config = test_config();
+    config.openai_base_url = "http://127.0.0.1:1".into();
+    config.openai_auth_header = Some("Bearer must-not-replace-caller".into());
+    let (origin, task) = serve(router_for_launched_session(config, "nrp_websocket")).await;
+    for credential in [None, Some("wrong-token"), Some("nrp_websocket")] {
+        let mut request = format!("{}/v1/live?model=voice", origin.replacen("http", "ws", 1))
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            crate::agents::pi::alignment::UPSTREAM_BASE_URL_HEADER,
+            upstream.parse().unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert("authorization", "Bearer caller-voice-key".parse().unwrap());
+        if let Some(credential) = credential {
+            request.headers_mut().insert(
+                crate::provider_auth::TRANSPARENT_PROXY_CREDENTIAL_HEADER,
+                credential.parse().unwrap(),
+            );
+        }
+        let result = tokio_tungstenite::connect_async(request).await;
+        if credential == Some("nrp_websocket") {
+            let (mut socket, _) = result.unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                tokio_tungstenite::tungstenite::Message::Binary(vec![0, 1, 255].into())
+            );
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    "named".into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                tokio_tungstenite::tungstenite::Message::Text("named".into())
+            );
+            drop(socket);
+        } else {
+            let error = result.unwrap_err();
+            let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+                panic!("{error}");
+            };
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+    task.abort();
+    provider_task.abort();
+}
+
+#[tokio::test]
+async fn unmanaged_routes_preserve_streaming_and_error_responses_without_sessions() {
+    use crate::gateway::websocket::tests::serve;
+    let provider = Router::new().fallback(|request: Request<Body>| async move {
+        assert!(
+            request
+                .headers()
+                .keys()
+                .all(|name| !name.as_str().starts_with("x-nemo-relay-"))
+        );
+        let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let streaming = body.as_ref() == br#"{"stream":true}"#;
+        Response::builder()
+            .status(if streaming {
+                StatusCode::OK
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            })
+            .header("retry-after", "5")
+            .header(
+                "content-type",
+                if streaming {
+                    "text/event-stream"
+                } else {
+                    "application/octet-stream"
+                },
+            )
+            .body(if streaming {
+                Body::from_stream(futures_util::stream::iter([
+                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: opaque\n\n")),
+                    Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")),
+                ]))
+            } else {
+                Body::from(vec![0, 255, 1])
+            })
+            .unwrap()
+    });
+    let (upstream, provider_task) = serve(provider).await;
+    let mut config = test_config();
+    config.openai_base_url = upstream;
+    let state = AppState::new(config);
+    let app = router_with_state(state.clone());
+    for path in [
+        "/v1/live",
+        "/v1/live/sessions",
+        "/v1/realtime/calls",
+        "/v1/responses/compact",
+        "/v1/images/edits",
+        "/v1/memories/trace_summarize",
+        "/v1/alpha/search",
+    ] {
+        for streaming in [false, true] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("authorization", "Bearer caller-key")
+                        .header("content-type", "application/json")
+                        .header("x-nemo-relay-private", "must-not-leak")
+                        .body(Body::from(if streaming {
+                            r#"{"stream":true}"#
+                        } else {
+                            "{}"
+                        }))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if streaming {
+                    StatusCode::OK
+                } else {
+                    StatusCode::TOO_MANY_REQUESTS
+                },
+                "{path}"
+            );
+            assert_eq!(response.headers()["retry-after"], "5");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                bytes.as_ref(),
+                if streaming {
+                    b"data: opaque\n\ndata: [DONE]\n\n".as_slice()
+                } else {
+                    &[0, 255, 1]
+                },
+                "{path}"
+            );
+        }
+    }
+    assert!(!state.sessions.has_open_sessions().await);
+    provider_task.abort();
+}
+
+#[tokio::test]
+async fn websocket_tunnel_blocks_idle_shutdown_until_disconnect() {
+    use crate::gateway::websocket::tests::{provider, serve};
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let (upstream, provider_task, _) = provider().await;
+    let mut config = test_config();
+    config.openai_base_url = upstream;
+    let state = AppState::new(config);
+    let (origin, task) = serve(router_with_state(state.clone())).await;
+    let mut request = format!("{}/v1/live?model=voice", origin.replacen("http", "ws", 1))
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        "Bearer caller-voice-key".parse().unwrap(),
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    socket.next().await.unwrap().unwrap();
+    assert_eq!(state.active_websockets.load(Ordering::Acquire), 1);
+    assert!(!state.sessions.has_open_sessions().await);
+    let timeout = Duration::from_secs(1);
+    *state.last_activity.lock().unwrap() = std::time::Instant::now() - timeout - timeout;
+    let idle = tokio::spawn(idle_shutdown_future(state.clone(), timeout));
+    tokio::time::sleep(timeout + Duration::from_millis(100)).await;
+    assert!(
+        !idle.is_finished(),
+        "an open tunnel must prevent idle shutdown"
+    );
+    drop(socket);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.active_websockets.load(Ordering::Acquire) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !idle_shutdown_ready(&state.last_activity, timeout, state.has_open_activity()).await,
+        "closing a tunnel must start a fresh idle period"
+    );
+    tokio::time::timeout(Duration::from_secs(3), idle)
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    provider_task.abort();
+}
+
+/// Verifies pi lifecycle and tool hooks require credentials and respect session ownership.
+#[tokio::test]
+async fn pi_hooks_require_credentials_and_reject_cross_owner_injection() {
+    let _guard = PLUGIN_CONFIG_TEST_LOCK.lock().await;
+    let key = BootstrapChallengeKey::from_bytes(b"pi hook authentication test");
+    let state =
+        AppState::new_with_bootstrap(test_config(), None, Some(key.clone()), true, None, None);
+    let app = router_with_state(state);
+    let request = |session: &str, event: &str, client: Option<&str>| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/hooks/pi")
+            .header("content-type", "application/json");
+        if let Some(client) = client {
+            request = request
+                .header(BOOTSTRAP_CLIENT_TOKEN_HEADER, key.client_token())
+                .header(HOOK_CLIENT_TOKEN_HEADER, key.hook_client_token(client));
+        }
+        request.body(Body::from(json!({
+            "session_id": session, "hook_event_name": event,
+            "tool_call_id": "forged-call", "tool_name": "read", "input": {"path": "README.md"}
+        }).to_string())).unwrap()
+    };
+    let response = app
+        .clone()
+        .oneshot(request("pi-victim", "session_start", Some("victim")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    for client in [None, Some("attacker")] {
+        for event in ["session_start", "tool_call", "session_shutdown"] {
+            let response = app
+                .clone()
+                .oneshot(request("pi-victim", event, client))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{event} from {client:?}"
+            );
+        }
+    }
+    // The victim's credential remains valid after attempted shutdown and injection.
+    let response = app
+        .clone()
+        .oneshot(request("pi-victim", "tool_call", Some("victim")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .oneshot(request("pi-victim", "session_shutdown", Some("victim")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn gateway_preserves_remote_guardrails_http_error_statuses() {
+    let _guard = PLUGIN_CONFIG_TEST_LOCK.lock().await;
+    for status in [StatusCode::FORBIDDEN, StatusCode::NOT_FOUND] {
+        let _ = nemo_relay::plugin::test_close_plugin_host();
+        let (upstream, upstream_calls) =
+            spawn_mock_upstream(status, "application/json", "backend error").await;
+        let mut config = test_config();
+        config.plugin_config = Some(json!({
+            "version": 1,
+            "components": [{ "kind": "nemo_guardrails", "enabled": true, "config": {
+                "mode": "remote", "codec": "openai_chat",
+                "remote": { "endpoint": upstream, "config_id": "default" }
+            }}]
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle =
+            tokio::spawn(async move { serve_listener(listener, config, Some(shutdown_rx)).await });
+        wait_for_gateway(&url).await;
+        for stream in [false, true] {
+            let response = test_http_client().post(format!("{url}/v1/chat/completions"))
+                .json(&json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}], "stream": stream}))
+                .send().await.unwrap();
+            assert_eq!(response.status(), status);
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["error"]["type"], "nemo_relay_gateway_error");
+        }
+        assert_eq!(
+            upstream_calls.load(Ordering::SeqCst),
+            2,
+            "one remote attempt per request"
+        );
+        shutdown_tx.send(()).unwrap();
+        handle.await.unwrap().unwrap();
+        let _ = nemo_relay::plugin::test_close_plugin_host();
+    }
+}
+
+#[tokio::test]
+async fn gateway_clients_never_replay_credentials_or_prompts_on_redirect() {
+    for client_named in [false, true] {
+        let sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let location = format!("http://{}/collect", sink.local_addr().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected_location = location.clone();
+        let app = Router::new().fallback(move |request: Request<Body>| {
+            let location = location.clone();
+            async move {
+                assert_eq!(request.headers()["x-api-key"], "placeholder-provider-key");
+                assert_eq!(request.headers()["authorization"], "Bearer placeholder");
+                assert_eq!(
+                    axum::body::to_bytes(request.into_body(), 1024)
+                        .await
+                        .unwrap(),
+                    "private prompt"
+                );
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [(header::LOCATION, location)],
+                )
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = gateway_http_client(Some(Duration::from_secs(2)), client_named, false)
+            .post(format!("http://{address}/v1/messages"))
+            .header("x-api-key", "placeholder-provider-key")
+            .bearer_auth("placeholder")
+            .body("private prompt")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.headers()[header::LOCATION], expected_location);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), sink.accept())
+                .await
+                .is_err()
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn gateway_configured_upstream_redirect_does_not_export_injected_key() {
+    let _guard = PLUGIN_CONFIG_TEST_LOCK.lock().await;
+    let _env = EnvScope::set(&[(
+        "ANTHROPIC_API_KEY",
+        Some(std::ffi::OsStr::new("sk-ant-placeholder")),
+    )]);
+    let sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let location = format!("http://{}/collect", sink.local_addr().unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (captured, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    let upstream = Router::new().fallback(move |request: Request<Body>| {
+        let location = location.clone();
+        let captured = captured.clone();
+        async move {
+            let (parts, body) = request.into_parts();
+            let bytes = axum::body::to_bytes(body, 4096).await.unwrap();
+            captured.send((parts.headers, bytes)).unwrap();
+            (
+                StatusCode::TEMPORARY_REDIRECT,
+                [(header::LOCATION, location)],
+            )
+        }
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let mut config = test_config();
+    config.anthropic_base_url = format!("http://{address}");
+    let key = BootstrapChallengeKey::from_bytes(b"redirect test challenge key");
+    let app = router_with_state(AppState::new_with_bootstrap(
+        config,
+        None,
+        Some(key.clone()),
+        true,
+        None,
+        None,
+    ));
+    let gateway_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_url = format!("http://{}", gateway_listener.local_addr().unwrap());
+    let gateway = tokio::spawn(async move {
+        axum::serve(gateway_listener, app).await.unwrap();
+    });
+    let caller = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .timeout(Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .unwrap();
+    for streaming in [false, true] {
+        let response = caller
+            .post(format!("{gateway_url}/v1/messages"))
+            .header(
+                crate::configuration::BOOTSTRAP_CLIENT_TOKEN_HEADER,
+                key.client_token(),
+            )
+            .json(&json!({
+                "model": "claude-test", "max_tokens": 1, "stream": streaming,
+                "messages": [{"role": "user", "content": "private prompt"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert!(!response.headers().contains_key(header::LOCATION));
+        assert_eq!(
+            response.url().as_str(),
+            format!("{gateway_url}/v1/messages")
+        );
+        let (headers, bytes) = requests.recv().await.unwrap();
+        assert_eq!(headers["x-api-key"], "sk-ant-placeholder");
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["messages"][0]["content"], "private prompt");
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), sink.accept())
+            .await
+            .is_err()
+    );
+    gateway.abort();
+    server.abort();
+}
+
+#[tokio::test]
+async fn unmanaged_routes_forward_only_client_credentials() {
+    let _env = crate::test_support::EnvScope::set(&[(
+        "OPENAI_API_KEY",
+        Some(std::ffi::OsStr::new("relay-environment-secret")),
+    )]);
+    for configured in [None, Some("Bearer relay-owned-secret")] {
+        async fn echo(request: Request<Body>) -> Response<Body> {
+            Response::builder()
+                .status(StatusCode::CREATED)
+                .body(Body::from(
+                    request
+                        .headers()
+                        .get("authorization")
+                        .map_or("absent", |value| value.to_str().unwrap())
+                        .to_owned(),
+                ))
+                .unwrap()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = GatewayConfig {
+            openai_base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
+            chatgpt_codex_base_url: Some(format!("http://{}", listener.local_addr().unwrap())),
+            openai_auth_header: configured.map(str::to_owned),
+            ..GatewayConfig::default()
+        };
+        let provider = axum::Router::new().fallback(echo);
+        let task = tokio::spawn(async move { axum::serve(listener, provider).await.unwrap() });
+        let app = router_with_state(AppState::new(config));
+        for path in [
+            "/v1/responses/compact",
+            "/v1/images/generations",
+            "/v1/realtime/calls",
+            "/v1/live/sessions",
+            "/v1/images/edits",
+            "/v1/alpha/search",
+            "/v1/memories/trace_summarize",
+        ] {
+            for credential in [
+                None,
+                Some("Bearer caller-key"),
+                Some("Bearer eyJhbGciOiJIUzI1NiJ9.deadbeef.signature"),
+            ] {
+                let mut request = Request::post(path)
+                    .header("content-type", "application/json")
+                    .header("x-nemo-relay-worker-token", "data-secret");
+                if let Some(credential) = credential {
+                    request = request.header("authorization", credential);
+                }
+                let request = request.body(Body::from("{}")).unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::CREATED, "{path}");
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(
+                    bytes.as_ref(),
+                    credential.unwrap_or("absent").as_bytes(),
+                    "{path}"
+                );
+            }
+        }
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn gateway_reuses_unchanged_wire_bodies_and_reencodes_execution_edits() {
+    const NAME: &str = "gateway-wire-body-reuse";
+    let _request_cleanup = RequestInterceptCleanup(NAME);
+    let _execution_cleanup = LlmExecutionInterceptCleanup(NAME);
+    let _stream_cleanup = LlmStreamExecutionInterceptCleanup(NAME);
+    register_llm_request_intercept(
+        NAME,
+        1,
+        false,
+        Arc::new(|_, mut request, annotated| {
+            Box::pin(async move {
+                if request.headers.contains_key("x-wire-body-reuse") {
+                    request
+                        .headers
+                        .insert("x-body-header-edit".into(), json!("applied"));
+                    request
+                        .headers
+                        .insert("content-encoding".into(), json!("gzip"));
+                }
+                Ok(LlmRequestInterceptOutcome::new(request, annotated))
+            })
+        }),
+    )
+    .unwrap();
+    register_llm_execution_intercept(
+        NAME,
+        1,
+        Arc::new(|_, mut request, _, next| {
+            Box::pin(async move {
+                if request
+                    .headers
+                    .get("x-wire-body-edit")
+                    .and_then(Value::as_str)
+                    == Some("yes")
+                {
+                    request.content["input"] = json!("edited during execution");
+                }
+                next(request).await
+            })
+        }),
+    )
+    .unwrap();
+    register_llm_stream_execution_intercept(
+        NAME,
+        1,
+        Arc::new(|_, mut request, _, next| {
+            Box::pin(async move {
+                if request
+                    .headers
+                    .get("x-wire-body-edit")
+                    .and_then(Value::as_str)
+                    == Some("yes")
+                {
+                    request.content["input"] = json!("edited during execution");
+                }
+                next(request).await
+            })
+        }),
+    )
+    .unwrap();
+
+    type Captured = Arc<Mutex<Vec<(Bytes, HeaderMap)>>>;
+    async fn provider(State(captured): State<Captured>, request: Request<Body>) -> Response {
+        let headers = request.headers().clone();
+        let body = request.into_body().collect().await.unwrap().to_bytes();
+        let decoded = if headers.get(header::CONTENT_ENCODING).is_some() {
+            zstd::stream::decode_all(body.as_ref()).unwrap()
+        } else {
+            body.to_vec()
+        };
+        let payload: Value = serde_json::from_slice(&decoded).unwrap();
+        captured.lock().unwrap().push((body, headers));
+        let response =
+            json!({"id": "resp_body", "model": "gpt-test", "status": "completed", "output": []});
+        if payload["stream"] == true {
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                format!(
+                    "data: {}\n\n",
+                    json!({"type": "response.completed", "response": response})
+                ),
+            )
+                .into_response()
+        } else {
+            Json(response).into_response()
+        }
+    }
+    let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream_app = Router::new()
+        .route("/v1/responses", post(provider))
+        .with_state(captured.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = TestServer {
+        url: format!("http://{address}"),
+        handle: tokio::spawn(async move { axum::serve(listener, upstream_app).await.unwrap() }),
+    };
+    let mut config = test_config();
+    config.openai_base_url = upstream.url();
+    let app = router(config);
+    for streaming in [false, true] {
+        for compressed in [false, true] {
+            for edit_body in [false, true] {
+                let raw = format!(
+                    r#"{{ "model" : "gpt-test", "input" : "original", "stream" : {streaming} }}"#
+                );
+                let wire = if compressed {
+                    zstd::stream::encode_all(raw.as_bytes(), 1).unwrap()
+                } else {
+                    raw.into_bytes()
+                };
+                let mut builder = Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .header("x-wire-body-reuse", "yes");
+                if compressed {
+                    builder = builder.header(header::CONTENT_ENCODING, "zstd");
+                }
+                if edit_body {
+                    builder = builder.header("x-wire-body-edit", "yes");
+                }
+                let response = app
+                    .clone()
+                    .oneshot(builder.body(Body::from(wire.clone())).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                response.into_body().collect().await.unwrap();
+                let (sent, headers) = captured.lock().unwrap().last().unwrap().clone();
+                assert_eq!(headers["x-body-header-edit"], "applied");
+                if edit_body {
+                    assert!(!headers.contains_key(header::CONTENT_ENCODING));
+                    let payload: Value = serde_json::from_slice(&sent).unwrap();
+                    assert_eq!(payload["input"], "edited during execution");
+                } else {
+                    assert_eq!(sent.as_ref(), wire);
+                    assert_eq!(
+                        headers
+                            .get(header::CONTENT_ENCODING)
+                            .map(|value| value.to_str().unwrap()),
+                        compressed.then_some("zstd")
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(captured.lock().unwrap().len(), 8);
 }

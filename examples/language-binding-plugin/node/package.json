@@ -1,10 +1,10 @@
 {
   "name": "nemo-relay-node-language-binding-plugin-example",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "pretest": "npm run build-debug --workspace=nemo-relay-node",
+    "pretest": "npm run build-debug --workspace=nemo-relay-node -- --features __skip-implicit-config",
     "start": "node main.mjs",
     "test": "node --test test-plugin.mjs"
   },

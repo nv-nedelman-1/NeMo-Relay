@@ -1128,6 +1128,41 @@ pub(crate) async fn with_active_event_trace_context<T>(
     with_anchored_active_event(active_event, trace_context, future).await
 }
 
+/// Bind a synchronous tool lifecycle subscriber to the observed tool scope.
+/// The event may already be closed, so anchor it to the delivery snapshot rather
+/// than changing the live scope stack or reopening the tool.
+pub(crate) fn with_thread_active_event_trace_context<T>(
+    uuid: Uuid,
+    trace_context: Option<W3cTraceContext>,
+    callback: impl FnOnce() -> T,
+) -> T {
+    struct RestoreActiveEvent {
+        event: Option<AnchoredActiveEvent>,
+        trace_context: Option<W3cTraceContext>,
+    }
+
+    impl Drop for RestoreActiveEvent {
+        fn drop(&mut self) {
+            THREAD_ACTIVE_EVENT.with(|event| *event.borrow_mut() = self.event.take());
+            THREAD_ACTIVE_EVENT_TRACE_CONTEXT
+                .with(|context| *context.borrow_mut() = self.trace_context.take());
+        }
+    }
+
+    let (scope_stack, anchor_scope_uuid) = scope_stack_identity_and_anchor();
+    let event = AnchoredActiveEvent {
+        event_uuid: uuid,
+        scope_stack,
+        anchor_scope_uuid,
+    };
+    let _restore = RestoreActiveEvent {
+        event: THREAD_ACTIVE_EVENT.with(|current| current.replace(Some(event))),
+        trace_context: THREAD_ACTIVE_EVENT_TRACE_CONTEXT
+            .with(|current| current.replace(trace_context)),
+    };
+    callback()
+}
+
 pub(crate) async fn with_anchored_active_event<T>(
     active_event: AnchoredActiveEvent,
     trace_context: Option<W3cTraceContext>,
@@ -1217,6 +1252,45 @@ thread_local! {
     static THREAD_ACTIVE_EVENT: RefCell<Option<AnchoredActiveEvent>> = const { RefCell::new(None) };
     /// Exact W3C context associated with the propagated managed event.
     static THREAD_ACTIVE_EVENT_TRACE_CONTEXT: RefCell<Option<W3cTraceContext>> = const { RefCell::new(None) };
+}
+
+pub use nemo_relay_types::api::scope::{ScopeStackEntry, ScopeStackSnapshot};
+
+/// Return detached identities from the calling context's explicitly active stack.
+///
+/// Returns None without creating or activating a stack when no override, task,
+/// or explicit thread binding exists. Includes implicit and synthetic entries.
+/// Lock poisoning returns an error; no live handles escape the read.
+pub fn current_scope_stack_snapshot() -> Result<Option<ScopeStackSnapshot>> {
+    let stack = current_context_scope_stack().or_else(|| {
+        THREAD_SCOPE_STACK_EXPLICIT.with(|explicit| {
+            explicit
+                .get()
+                .then(|| THREAD_SCOPE_STACK.with(|stack| stack.borrow().clone()))
+        })
+    });
+    stack.as_ref().map(scope_stack_snapshot).transpose()
+}
+
+/// Project a selected binding to detached values under a single read lock.
+///
+/// Foreign language and worker adapters select their exact execution binding
+/// before calling this helper. Serialization and callbacks occur after return.
+#[doc(hidden)]
+pub fn scope_stack_snapshot(stack: &ScopeStackHandle) -> Result<ScopeStackSnapshot> {
+    let guard = stack
+        .read()
+        .map_err(|error| FlowError::Internal(error.to_string()))?;
+    Ok(ScopeStackSnapshot {
+        scopes: guard
+            .scopes()
+            .iter()
+            .map(|scope| ScopeStackEntry {
+                scope_id: scope.uuid,
+                scope_type: scope.scope_type,
+            })
+            .collect(),
+    })
 }
 
 /// Return the scope stack visible to the current execution context.

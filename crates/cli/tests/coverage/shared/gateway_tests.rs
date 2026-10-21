@@ -1,6 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+fn auth_test_config(route: ProviderRoute, header: Option<&str>) -> GatewayConfig {
+    let mut config = GatewayConfig::default();
+    if route.is_anthropic() {
+        config.anthropic_auth_header = header.map(str::to_owned);
+    } else {
+        config.openai_auth_header = header.map(str::to_owned);
+    }
+    config
+}
+
 use super::*;
 use crate::agents::shared::alignment::GatewayRouteKind;
 use crate::configuration::GatewayConfig;
@@ -34,6 +44,65 @@ fn environment_authorization() -> crate::provider_auth::ProviderRequestAuthoriza
     crate::provider_auth::ProviderRequestAuthorization {
         source_credential: crate::provider_auth::SourceCredentialDisposition::Absent,
         allow_environment_provider_auth: true,
+    }
+}
+
+#[tokio::test]
+async fn custom_openai_upstream_preserves_corporate_tokens_and_prompts() {
+    use base64::Engine;
+
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(br#"{"iss":"https://login.corporate.example"}"#);
+    let corporate_token = format!("Bearer eyJhbGciOiJSUzI1NiJ9.{payload}.c2lnbmF0dXJl");
+    for token in [corporate_token.as_str(), "Bearer at-corporate-token"] {
+        for allow_provider_auth in [false, true] {
+            let config = GatewayConfig {
+                openai_base_url: "https://corporate.example/v1".into(),
+                openai_auth_header: Some("Bearer administrator-key".into()),
+                ..GatewayConfig::default()
+            };
+            let body =
+                r#"{"model":"internal","messages":[{"role":"user","content":"private prompt"}]}"#;
+            let request = Request::post("/v1/chat/completions?trace=private")
+                .header("authorization", token)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let mut authorization = environment_authorization();
+            authorization.allow_environment_provider_auth = allow_provider_auth;
+            let prepared =
+                prepare_gateway_request(&config, request, authorization, "/v1/chat/completions")
+                    .await
+                    .unwrap();
+            assert_eq!(
+                prepared.upstream_url,
+                "https://corporate.example/v1/chat/completions?trace=private"
+            );
+            assert_eq!(prepared.headers["authorization"], token);
+            assert_eq!(prepared.body_bytes, body);
+            assert_eq!(
+                daemon_provider_upstream_url_with_access(
+                    &prepared.headers,
+                    "/v1/chat/completions?trace=private",
+                    &config,
+                    false,
+                    allow_provider_auth,
+                )
+                .unwrap()
+                .as_deref(),
+                Some(prepared.upstream_url.as_str()),
+            );
+            assert_eq!(
+                daemon_provider_forward_headers_with_access(
+                    &prepared.headers,
+                    "/v1/chat/completions",
+                    &config,
+                    allow_provider_auth,
+                )
+                .unwrap()["authorization"],
+                token,
+            );
+        }
     }
 }
 
@@ -450,8 +519,17 @@ fn generation_route_codecs_reject_stream_mode_changes() {
                 headers: Map::new(),
                 content,
             };
-            let mut annotated = codec.decode(&request).unwrap();
+            let baseline = codec.decode(&request).unwrap();
+            let mut annotated = baseline.clone();
             annotated.stream = Some(!original_streaming);
+            let baseline_error = codec
+                .encode_with_baseline(&annotated, &request, &baseline)
+                .unwrap_err();
+            assert!(
+                baseline_error
+                    .to_string()
+                    .contains("cannot change stream mode")
+            );
             let error = codec.encode(&annotated, &request).unwrap_err();
             assert!(
                 error.to_string().contains("cannot change stream mode"),
@@ -518,8 +596,13 @@ fn provider_routes_preserve_path_query_and_choose_upstream() {
         bind: "127.0.0.1:0".parse().unwrap(),
         openai_base_url: "http://openai/v1/".into(),
         openai_auth_header: None,
+        openai_api_key: None,
+        openai_api_key_helper: None,
         anthropic_base_url: "http://anthropic/".into(),
         anthropic_auth_header: None,
+        anthropic_api_key: None,
+        anthropic_api_key_helper: None,
+        chatgpt_codex_base_url: None,
         metadata: None,
         plugin_config: None,
         max_hook_payload_bytes: crate::configuration::DEFAULT_MAX_HOOK_PAYLOAD_BYTES,
@@ -569,8 +652,13 @@ fn openai_upstream_url_accepts_origin_or_v1_base() {
         bind: "127.0.0.1:0".parse().unwrap(),
         openai_base_url: "http://openai".into(),
         openai_auth_header: None,
+        openai_api_key: None,
+        openai_api_key_helper: None,
         anthropic_base_url: "http://anthropic".into(),
         anthropic_auth_header: None,
+        anthropic_api_key: None,
+        anthropic_api_key_helper: None,
+        chatgpt_codex_base_url: None,
         metadata: None,
         plugin_config: None,
         max_hook_payload_bytes: crate::configuration::DEFAULT_MAX_HOOK_PAYLOAD_BYTES,
@@ -605,8 +693,13 @@ fn anthropic_upstream_url_accepts_origin_or_v1_base() {
         bind: "127.0.0.1:0".parse().unwrap(),
         openai_base_url: "http://openai".into(),
         openai_auth_header: None,
+        openai_api_key: None,
+        openai_api_key_helper: None,
         anthropic_base_url: "http://anthropic".into(),
         anthropic_auth_header: None,
+        anthropic_api_key: None,
+        anthropic_api_key_helper: None,
+        chatgpt_codex_base_url: None,
         metadata: None,
         plugin_config: None,
         max_hook_payload_bytes: crate::configuration::DEFAULT_MAX_HOOK_PAYLOAD_BYTES,
@@ -797,6 +890,7 @@ fn internal_dispatch_controls_are_consumed_and_never_forwarded() {
         Some(&request),
         "http://default.invalid/v1/chat/completions",
         ProviderRoute::OpenAiChatCompletions,
+        None,
     );
     assert_eq!(effective.url, "http://127.0.0.1:9000/v1/responses");
     assert_eq!(effective.target_route, ProviderRoute::OpenAiResponses);
@@ -851,6 +945,7 @@ fn explicit_keyless_target_drops_source_credentials() {
         Some(&request),
         "http://source.invalid/v1/responses",
         ProviderRoute::OpenAiResponses,
+        None,
     );
 
     assert_eq!(
@@ -862,8 +957,8 @@ fn explicit_keyless_target_drops_source_credentials() {
     ));
 }
 
-#[test]
-fn cross_protocol_target_uses_only_binding_owned_authentication() {
+#[tokio::test]
+async fn cross_protocol_target_uses_only_binding_owned_authentication() {
     let mut source_headers = HeaderMap::new();
     source_headers.insert(
         header::AUTHORIZATION,
@@ -890,6 +985,7 @@ fn cross_protocol_target_uses_only_binding_owned_authentication() {
         Some(&request),
         "http://source.invalid/v1/responses",
         ProviderRoute::OpenAiResponses,
+        None,
     );
 
     assert_eq!(effective.target_route, ProviderRoute::AnthropicMessages);
@@ -903,15 +999,13 @@ fn cross_protocol_target_uses_only_binding_owned_authentication() {
         "anthropic-binding-key"
     );
 
-    let built = inject_provider_auth_with_env(
+    let built = inject_provider_auth(
         test_http_client().post("http://anthropic-target.invalid/v1/messages"),
         effective.target_route,
-        &effective.headers,
         false,
-        None,
-        |_: &str| Some("ambient-key-must-not-win".into()),
+        &auth_test_config(effective.target_route, None),
     )
-    .build()
+    .await
     .unwrap();
     assert!(built.headers().get(header::AUTHORIZATION).is_none());
 }
@@ -934,6 +1028,7 @@ fn same_route_rewrite_without_explicit_dispatch_preserves_source_auth_policy() {
         Some(&request),
         "http://source.invalid/v1/responses",
         ProviderRoute::OpenAiResponses,
+        None,
     );
 
     assert_eq!(
@@ -969,6 +1064,7 @@ fn malformed_dispatch_route_discards_the_override_url() {
         Some(&request),
         "http://default.invalid/v1/chat/completions",
         ProviderRoute::OpenAiChatCompletions,
+        None,
     );
 
     assert_eq!(effective.url, "http://default.invalid/v1/chat/completions");
@@ -1004,6 +1100,7 @@ fn dispatch_url_without_a_route_remains_supported() {
         Some(&request),
         "http://default.invalid/v1/chat/completions",
         ProviderRoute::OpenAiChatCompletions,
+        None,
     );
 
     assert_eq!(effective.url, "http://127.0.0.1:9000/v1/chat/completions");
@@ -1286,6 +1383,7 @@ async fn streaming_provider_error_does_not_poison_the_next_request() {
     let func = build_streaming_func(
         state,
         &prepared,
+        SourceRequestBody::default(),
         Arc::new(CapturedUpstreamFailures::default()),
         crate::operational::OperationalContext::new(),
     );
@@ -1357,6 +1455,7 @@ async fn buffered_body_read_failure_stays_structured() {
     let func = build_buffered_func(
         state,
         &prepared,
+        SourceRequestBody::default(),
         Arc::new(CapturedUpstreamFailures::default()),
         crate::operational::OperationalContext::new(),
     );
@@ -1411,6 +1510,7 @@ async fn buffered_invalid_json_becomes_safe_upstream_failure() {
     let func = build_buffered_func(
         state,
         &prepared,
+        SourceRequestBody::default(),
         Arc::new(CapturedUpstreamFailures::default()),
         crate::operational::OperationalContext::new(),
     );
@@ -1704,13 +1804,15 @@ fn observable_headers_omit_connection_named_anthropic_protocol_headers() {
 
 #[test]
 fn strips_chatgpt_plus_jwt_from_openai_route_inbound() {
-    // When OPENAI_API_KEY is set the gateway strips JWT-shaped (`Bearer eyJ...`) Authorization
+    // When OPENAI_API_KEY is set the gateway strips OpenAI-issued JWT Authorization
     // from inbound OpenAI-route requests so the auth-injection path substitutes the env key
     // instead of forwarding the ChatGPT-Plus OAuth JWT.
     let mut inbound = HeaderMap::new();
     inbound.insert(
         "authorization",
-        HeaderValue::from_static("Bearer eyJhbGciOiJIUzI1NiJ9.deadbeef.signature"),
+        HeaderValue::from_static(
+            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczovL2F1dGgub3BlbmFpLmNvbSJ9.signature",
+        ),
     );
     let sanitized = strip_replaceable_agent_auth_headers_with_openai_key_state(
         &inbound,
@@ -1766,7 +1868,9 @@ fn preserves_jwt_when_no_replacement_key_available() {
     let mut inbound = HeaderMap::new();
     inbound.insert(
         "authorization",
-        HeaderValue::from_static("Bearer eyJhbGciOiJIUzI1NiJ9.deadbeef.signature"),
+        HeaderValue::from_static(
+            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczovL2F1dGgub3BlbmFpLmNvbSJ9.signature",
+        ),
     );
     let sanitized = strip_replaceable_agent_auth_headers_with_openai_key_state(
         &inbound,
@@ -1893,60 +1997,51 @@ fn transparent_proxy_rejects_missing_or_foreign_credentials() {
     );
 }
 
-#[test]
-fn injects_openai_bearer_when_inbound_has_no_auth() {
+#[tokio::test]
+async fn injects_openai_bearer_when_inbound_has_no_auth() {
+    let _env = crate::test_support::EnvScope::set(&[(
+        "OPENAI_API_KEY",
+        Some(std::ffi::OsStr::new("sk-test-123")),
+    )]);
     // Foreground gateway mode retains the convenience of supplying its own provider key.
     let http = test_http_client();
-    let inbound = HeaderMap::new();
-    let env = |k: &str| match k {
-        "OPENAI_API_KEY" => Some("sk-test-123".into()),
-        _ => None,
-    };
     let builder = http.get("http://upstream/v1/responses");
-    let built = inject_provider_auth_with_env(
+    let built = inject_provider_auth(
         builder,
         ProviderRoute::OpenAiResponses,
-        &inbound,
         true,
-        None,
-        env,
+        &auth_test_config(ProviderRoute::OpenAiResponses, None),
     )
-    .build()
+    .await
     .unwrap();
-    assert_eq!(
-        built.headers().get("authorization").unwrap(),
-        "Bearer sk-test-123"
-    );
+    assert_eq!(built.headers()["authorization"], "Bearer sk-test-123");
 }
 
-#[test]
-fn injects_anthropic_x_api_key_for_anthropic_routes() {
+#[tokio::test]
+async fn injects_anthropic_x_api_key_for_anthropic_routes() {
+    let _env = crate::test_support::EnvScope::set(&[(
+        "ANTHROPIC_API_KEY",
+        Some(std::ffi::OsStr::new("sk-ant-test")),
+    )]);
     let http = test_http_client();
-    let inbound = HeaderMap::new();
-    let env = |k: &str| match k {
-        "ANTHROPIC_API_KEY" => Some("sk-ant-test".into()),
-        _ => None,
-    };
     let builder = http.post("http://upstream/v1/messages");
-    let built = inject_provider_auth_with_env(
+    let built = inject_provider_auth(
         builder,
         ProviderRoute::AnthropicMessages,
-        &inbound,
         true,
-        None,
-        env,
+        &auth_test_config(ProviderRoute::AnthropicMessages, None),
     )
-    .build()
+    .await
     .unwrap();
-    assert_eq!(built.headers().get("x-api-key").unwrap(), "sk-ant-test");
+    assert_eq!(built.headers()["x-api-key"], "sk-ant-test");
     // Anthropic uses `x-api-key`, not Authorization. The gateway must not duplicate the secret
     // into a Bearer header — that would defeat the purpose of using the provider's standard
     // auth scheme and might trigger upstream-side rejection of the conflicting auth.
     assert!(built.headers().get("authorization").is_none());
 }
 
-#[test]
-fn configured_auth_headers_are_provider_specific_and_precede_environment_keys() {
+#[tokio::test]
+async fn configured_auth_headers_are_provider_specific_and_precede_environment_keys() {
     let config = GatewayConfig {
         openai_auth_header: Some("Basic openai-custom".into()),
         anthropic_auth_header: Some("Bearer anthropic-custom".into()),
@@ -1964,26 +2059,19 @@ fn configured_auth_headers_are_provider_specific_and_precede_environment_keys() 
     for (route, expected) in [
         (ProviderRoute::OpenAiResponses, "Basic openai-custom"),
         (ProviderRoute::OpenAiChatCompletions, "Basic openai-custom"),
-        (
-            ProviderRoute::OpenAiImagesGenerations,
-            "Basic openai-custom",
-        ),
-        (ProviderRoute::OpenAiModels, "Basic openai-custom"),
         (ProviderRoute::AnthropicMessages, "Bearer anthropic-custom"),
         (
             ProviderRoute::AnthropicCountTokens,
             "Bearer anthropic-custom",
         ),
     ] {
-        let built = inject_provider_auth_with_env(
+        let built = inject_provider_auth(
             test_http_client().post("http://upstream"),
             route,
-            &HeaderMap::new(),
             true,
-            forwarding.configured_auth_header(route),
-            |_| Some("standard-env-key".into()),
+            &auth_test_config(route, forwarding.configured_auth_header(route)),
         )
-        .build()
+        .await
         .unwrap();
 
         assert_eq!(built.headers().get("authorization").unwrap(), expected);
@@ -1991,8 +2079,8 @@ fn configured_auth_headers_are_provider_specific_and_precede_environment_keys() 
     }
 }
 
-#[test]
-fn configured_openai_auth_replaces_chatgpt_jwt() {
+#[tokio::test]
+async fn configured_openai_auth_replaces_chatgpt_jwt() {
     let config = GatewayConfig {
         openai_auth_header: Some("Basic configured-openai".into()),
         ..GatewayConfig::default()
@@ -2000,14 +2088,17 @@ fn configured_openai_auth_replaces_chatgpt_jwt() {
     let mut inbound = HeaderMap::new();
     inbound.insert(
         "authorization",
-        HeaderValue::from_static("Bearer eyJhbGciOiJIUzI1NiJ9.deadbeef.signature"),
+        HeaderValue::from_static(
+            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczovL2F1dGgub3BlbmFpLmNvbSJ9.signature",
+        ),
     );
     let configured_auth_header = ProviderRoute::OpenAiResponses.configured_auth_header(&config);
     let sanitized = strip_replaceable_agent_auth_headers(
         &inbound,
         ProviderRoute::OpenAiResponses,
+        "/v1/responses",
         true,
-        configured_auth_header,
+        &config,
     );
     assert!(sanitized.get("authorization").is_none());
     assert_eq!(
@@ -2021,15 +2112,13 @@ fn configured_openai_auth_replaces_chatgpt_jwt() {
         None
     );
 
-    let request = inject_provider_auth_with_env(
+    let request = inject_provider_auth(
         test_http_client().post("http://upstream"),
         ProviderRoute::OpenAiResponses,
-        &sanitized,
         true,
-        configured_auth_header,
-        |_| None,
+        &auth_test_config(ProviderRoute::OpenAiResponses, configured_auth_header),
     )
-    .build()
+    .await
     .unwrap();
     assert_eq!(
         request.headers().get("authorization").unwrap(),
@@ -2037,8 +2126,8 @@ fn configured_openai_auth_replaces_chatgpt_jwt() {
     );
 }
 
-#[test]
-fn skips_injection_when_inbound_already_has_authorization() {
+#[tokio::test]
+async fn skips_injection_when_inbound_already_has_authorization() {
     // If the agent (e.g., a future codex version, or anyone using the gateway directly) sends
     // its own auth, we must not stomp on it.
     let http = test_http_client();
@@ -2047,58 +2136,45 @@ fn skips_injection_when_inbound_already_has_authorization() {
         "authorization",
         HeaderValue::from_static("Bearer agent-supplied"),
     );
-    let env = |_: &str| Some("sk-test-from-env".into());
-    let builder = http.post("http://upstream/v1/responses");
-    let built = inject_provider_auth_with_env(
+    let builder = http.post("http://upstream/v1/responses").headers(inbound);
+    let built = inject_provider_auth(
         builder,
         ProviderRoute::OpenAiResponses,
-        &inbound,
         true,
-        None,
-        env,
+        &auth_test_config(ProviderRoute::OpenAiResponses, None),
     )
-    .build()
+    .await
     .unwrap();
-    // The builder doesn't carry inbound headers itself (forward_upstream_request adds them in a
-    // separate loop), so the only header on `built` would be the env-injected one. Since the
-    // inbound had auth, we expect no injection at all.
-    assert!(built.headers().get("authorization").is_none());
+    assert_eq!(built.headers()["authorization"], "Bearer agent-supplied");
 }
 
-#[test]
-fn skips_injection_when_env_var_unset() {
+#[tokio::test]
+async fn skips_injection_when_env_var_unset() {
+    let _env = crate::test_support::EnvScope::set(&[("OPENAI_API_KEY", None)]);
     let http = test_http_client();
-    let inbound = HeaderMap::new();
-    let env = |_: &str| None;
     let builder = http.post("http://upstream/v1/responses");
-    let built = inject_provider_auth_with_env(
+    let built = inject_provider_auth(
         builder,
         ProviderRoute::OpenAiResponses,
-        &inbound,
         true,
-        None,
-        env,
+        &auth_test_config(ProviderRoute::OpenAiResponses, None),
     )
-    .build()
+    .await
     .unwrap();
     assert!(built.headers().get("authorization").is_none());
 }
 
-#[test]
-fn managed_sidecar_never_injects_forwarded_provider_credentials() {
+#[tokio::test]
+async fn managed_sidecar_never_injects_forwarded_provider_credentials() {
     let http = test_http_client();
-    let inbound = HeaderMap::new();
-    let env = |_: &str| Some("forwarded-secret".into());
     let builder = http.post("http://upstream/v1/responses");
-    let built = inject_provider_auth_with_env(
+    let built = inject_provider_auth(
         builder,
         ProviderRoute::OpenAiResponses,
-        &inbound,
         false,
-        None,
-        env,
+        &auth_test_config(ProviderRoute::OpenAiResponses, None),
     )
-    .build()
+    .await
     .unwrap();
 
     assert!(built.headers().get("authorization").is_none());
@@ -2111,7 +2187,9 @@ fn chatgpt_jwt_routes_to_chatgpt_backend_when_no_api_key() {
     let mut headers = HeaderMap::new();
     headers.insert(
         "authorization",
-        HeaderValue::from_static("Bearer eyJhbGciOiJIUzI1NiJ9.deadbeef.signature"),
+        HeaderValue::from_static(
+            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczovL2F1dGgub3BlbmFpLmNvbSJ9.signature",
+        ),
     );
     // With no OPENAI_API_KEY and a JWT, alignment returns the ChatGPT backend override.
     assert_eq!(
@@ -2127,11 +2205,15 @@ fn chatgpt_jwt_routes_to_chatgpt_backend_when_no_api_key() {
 }
 
 #[test]
-fn daemon_routes_chatgpt_oauth_on_all_openai_paths() {
+fn daemon_honors_custom_openai_base_for_chatgpt_oauth() {
     let mut headers = HeaderMap::new();
     headers.insert(
         "authorization",
         HeaderValue::from_static("Bearer at-codex-oauth-token"),
+    );
+    headers.insert(
+        "chatgpt-account-id",
+        axum::http::HeaderValue::from_static("test-account"),
     );
     let config = GatewayConfig {
         openai_base_url: "https://administrator.example/v1".into(),
@@ -2141,15 +2223,15 @@ fn daemon_routes_chatgpt_oauth_on_all_openai_paths() {
     for (path, expected) in [
         (
             "/responses?client=codex",
-            "https://chatgpt.com/backend-api/codex/responses?client=codex",
+            "https://administrator.example/v1/responses?client=codex",
         ),
         (
             "/v1/responses?client=codex",
-            "https://chatgpt.com/backend-api/codex/responses?client=codex",
+            "https://administrator.example/v1/responses?client=codex",
         ),
         (
             "/v1/models?client=codex",
-            "https://chatgpt.com/backend-api/codex/models?client=codex",
+            "https://administrator.example/v1/models?client=codex",
         ),
     ] {
         assert_eq!(
@@ -2167,7 +2249,7 @@ fn daemon_routes_chatgpt_oauth_on_all_openai_paths() {
         )
         .unwrap()
         .as_deref(),
-        Some("https://chatgpt.com/backend-api/codex/responses?client=codex")
+        Some("https://administrator.example/v1/responses?client=codex")
     );
 }
 
@@ -2176,7 +2258,9 @@ fn daemon_replaces_chatgpt_oauth_with_administrator_credential() {
     let mut headers = HeaderMap::new();
     headers.insert(
         "authorization",
-        HeaderValue::from_static("Bearer eyJhbGciOiJIUzI1NiJ9.deadbeef.signature"),
+        HeaderValue::from_static(
+            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczovL2F1dGgub3BlbmFpLmNvbSJ9.signature",
+        ),
     );
     let config = GatewayConfig {
         openai_base_url: "https://administrator.example/v1".into(),
@@ -2260,6 +2344,10 @@ fn daemon_named_upstream_precedes_chatgpt_oauth_inference() {
         http::header::AUTHORIZATION,
         HeaderValue::from_static("Bearer at-caller-controlled-token"),
     );
+    headers.insert(
+        "chatgpt-account-id",
+        axum::http::HeaderValue::from_static("test-account"),
+    );
 
     assert_eq!(
         daemon_provider_upstream_url(
@@ -2307,7 +2395,9 @@ fn anthropic_route_never_triggers_chatgpt_backend() {
     let mut headers = HeaderMap::new();
     headers.insert(
         "authorization",
-        HeaderValue::from_static("Bearer eyJhbGciOiJIUzI1NiJ9.deadbeef.signature"),
+        HeaderValue::from_static(
+            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczovL2F1dGgub3BlbmFpLmNvbSJ9.signature",
+        ),
     );
     assert_eq!(
         gateway_upstream_url_override_with_openai_key_state(
@@ -2325,7 +2415,9 @@ fn chatgpt_backend_url_omits_v1_prefix() {
     let mut headers = HeaderMap::new();
     headers.insert(
         "authorization",
-        HeaderValue::from_static("Bearer eyJhbGciOiJIUzI1NiJ9.deadbeef.signature"),
+        HeaderValue::from_static(
+            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczovL2F1dGgub3BlbmFpLmNvbSJ9.signature",
+        ),
     );
     // The ChatGPT backend expects paths directly under the base, not /v1-prefixed.
     assert_eq!(
@@ -2378,8 +2470,13 @@ async fn passthrough_rejects_unsupported_provider_path_directly() {
         bind: "127.0.0.1:0".parse().unwrap(),
         openai_base_url: "http://openai".into(),
         openai_auth_header: None,
+        openai_api_key: None,
+        openai_api_key_helper: None,
         anthropic_base_url: "http://anthropic".into(),
         anthropic_auth_header: None,
+        anthropic_api_key: None,
+        anthropic_api_key_helper: None,
+        chatgpt_codex_base_url: None,
         metadata: None,
         plugin_config: None,
         max_hook_payload_bytes: crate::configuration::DEFAULT_MAX_HOOK_PAYLOAD_BYTES,
@@ -2394,11 +2491,16 @@ async fn passthrough_rejects_unsupported_provider_path_directly() {
         transparent_proxy_credential: None,
         http: test_http_client(),
         http_no_redirect: test_http_client_no_redirect(),
+        http_helper: test_http_client_no_redirect(),
         sessions: SessionManager::new(config),
         last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        active_websockets: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         bootstrap_shutdown: None,
         instance_id: "test-instance".into(),
         bootstrap_tls: None,
+        bootstrap_handshake_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            crate::server::MAX_CONCURRENT_TLS_HANDSHAKES,
+        )),
         local_address: None,
     };
     let request = Request::builder()
@@ -2419,8 +2521,13 @@ async fn models_rejects_non_get_requests_directly() {
         bind: "127.0.0.1:0".parse().unwrap(),
         openai_base_url: "http://openai".into(),
         openai_auth_header: None,
+        openai_api_key: None,
+        openai_api_key_helper: None,
         anthropic_base_url: "http://anthropic".into(),
         anthropic_auth_header: None,
+        anthropic_api_key: None,
+        anthropic_api_key_helper: None,
+        chatgpt_codex_base_url: None,
         metadata: None,
         plugin_config: None,
         max_hook_payload_bytes: crate::configuration::DEFAULT_MAX_HOOK_PAYLOAD_BYTES,
@@ -2435,11 +2542,16 @@ async fn models_rejects_non_get_requests_directly() {
         transparent_proxy_credential: None,
         http: test_http_client(),
         http_no_redirect: test_http_client_no_redirect(),
+        http_helper: test_http_client_no_redirect(),
         sessions: SessionManager::new(config),
         last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        active_websockets: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         bootstrap_shutdown: None,
         instance_id: "test-instance".into(),
         bootstrap_tls: None,
+        bootstrap_handshake_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            crate::server::MAX_CONCURRENT_TLS_HANDSHAKES,
+        )),
         local_address: None,
     };
     let request = Request::builder()
@@ -2510,7 +2622,7 @@ async fn streaming_gateway_call_guard_finishes_when_body_is_dropped() {
             manager.clone(),
             prep.session_id,
             prep.owner_subagent_id,
-            Arc::new(Mutex::new(None)),
+            None,
             prep.session_finish,
             crate::operational::OperationalContext::new(),
         ),
@@ -2528,6 +2640,213 @@ async fn streaming_gateway_call_guard_finishes_when_body_is_dropped() {
         .await
         .unwrap();
     assert_eq!(closed, 1);
+}
+
+#[tokio::test]
+async fn streaming_gateway_call_guard_cancellation_while_waiting_releases_session() {
+    let manager = SessionManager::new(GatewayConfig::default());
+    let prep = manager
+        .prepare_gateway_call(
+            &HeaderMap::new(),
+            LlmGatewayStart {
+                session_id: Some("stream-cancel-wait".into()),
+                provider: "openai.responses".into(),
+                model_name: None,
+                subagent_id: None,
+                conversation_id: None,
+                generation_id: None,
+                request_id: None,
+                request: LlmRequest {
+                    headers: Map::new(),
+                    content: json!({"input": "wait"}),
+                },
+                streaming: true,
+                metadata: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    let (sender, ready) = oneshot::channel();
+    let mut guard = GatewayCallGuard::new(
+        manager.clone(),
+        prep.session_id,
+        prep.owner_subagent_id,
+        Some(ready),
+        prep.session_finish,
+        crate::operational::OperationalContext::new(),
+    );
+    {
+        let finish = guard.finish();
+        tokio::pin!(finish);
+        assert!(futures_util::poll!(finish.as_mut()).is_pending());
+        // Cancelling this wait must leave session ownership available to Drop.
+    }
+    drop(guard);
+    assert_eq!(
+        manager
+            .close_idle_sessions_at(
+                std::time::Instant::now() + Duration::from_secs(1),
+                Duration::from_millis(1),
+                "idle_timeout",
+            )
+            .await
+            .unwrap(),
+        0
+    );
+    // A failed observer drops its sender. Cleanup must proceed on that path too.
+    drop(sender);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let closed = manager
+                .close_idle_sessions_at(
+                    std::time::Instant::now() + Duration::from_secs(1),
+                    Duration::from_millis(1),
+                    "idle_timeout",
+                )
+                .await
+                .unwrap();
+            if closed == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn uncontended_stream_completion_finishes_before_observer_poll_without_copying_response() {
+    let captured_output = Arc::new(Mutex::new(None::<Value>));
+    let captured = captured_output.clone();
+    let subscriber = "inline-response-completion-once";
+    nemo_relay::api::subscriber::register_subscriber(
+        subscriber,
+        Arc::new(move |event| {
+            if event.scope_category() == Some(nemo_relay::api::event::ScopeCategory::End)
+                && event.name() == "codex-turn"
+                && event
+                    .metadata()
+                    .and_then(|m| m.get("session_id"))
+                    .and_then(Value::as_str)
+                    == Some("inline-completion")
+            {
+                *captured.lock().unwrap() = event.output().cloned();
+            }
+        }),
+    )
+    .unwrap();
+    let manager = SessionManager::new(GatewayConfig::default());
+    let prep = manager
+        .prepare_gateway_call(
+            &HeaderMap::new(),
+            LlmGatewayStart {
+                session_id: Some("inline-completion".into()),
+                provider: "openai.responses".into(),
+                model_name: None,
+                subagent_id: None,
+                conversation_id: None,
+                generation_id: None,
+                request_id: None,
+                request: LlmRequest {
+                    headers: Map::new(),
+                    content: json!({"input": "record output"}),
+                },
+                streaming: true,
+                metadata: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    let response = json!({"output_text": "x".repeat(65536)});
+    let pointer = response["output_text"].as_str().unwrap().as_ptr();
+    let (finalizer, observer, mut ready) = gateway_response_completion(
+        manager.clone(),
+        prep.session_id.clone(),
+        prep.owner_subagent_id.clone(),
+        Box::new(move || response),
+    );
+    let response = finalizer();
+    assert_eq!(response["output_text"].as_str().unwrap().as_ptr(), pointer);
+    // No background observer has run: readiness must come from completed bookkeeping.
+    assert_eq!(ready.try_recv(), Ok(()));
+    let newer_response = json!({"output_text": "a later response"});
+    manager
+        .record_gateway_response_hints(&prep.session_id, None, Cow::Borrowed(&newer_response))
+        .await;
+    // A delayed observer for the previous response must not overwrite newer output.
+    observer(&response).await.unwrap();
+    manager
+        .finish_gateway_call(
+            &prep.session_id,
+            prep.owner_subagent_id.as_deref(),
+            prep.session_finish,
+        )
+        .await;
+    manager.close_all("test_shutdown").await.unwrap();
+    nemo_relay::api::subscriber::flush_subscribers().unwrap();
+    assert_eq!(*captured_output.lock().unwrap(), Some(newer_response));
+    nemo_relay::api::subscriber::deregister_subscriber(subscriber).unwrap();
+}
+
+#[tokio::test]
+async fn stream_completion_observer_finishes_when_the_session_is_already_gone() {
+    let manager = SessionManager::new(GatewayConfig::default());
+    let response = json!({"output_text": "final"});
+    let (finalizer, observer, mut ready) = gateway_response_completion(
+        manager,
+        "removed-session".into(),
+        None,
+        Box::new(move || response),
+    );
+    let response = finalizer();
+    assert!(matches!(
+        ready.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    observer(&response).await.unwrap();
+    assert_eq!(ready.try_recv(), Ok(()));
+    assert_eq!(response["output_text"], "final");
+}
+
+// Exercise the same borrowed observer and finalization path used by the gateway.
+async fn managed_final_response_stream(
+    manager: &SessionManager,
+    prep: &GatewayCallPrep,
+    response: Value,
+    pending: bool,
+) -> (LlmJsonStream, oneshot::Receiver<()>) {
+    let (finalizer, observer, ready) = gateway_response_completion(
+        manager.clone(),
+        prep.session_id.clone(),
+        prep.owner_subagent_id.clone(),
+        Box::new(move || response),
+    );
+    let params = LlmStreamCallExecuteParams::builder()
+        .name("openai.responses")
+        .request(prep.request.clone())
+        .func(Arc::new(move |_| {
+            Box::pin(async move {
+                Ok(if pending {
+                    LlmJsonStream::new(futures_util::stream::pending())
+                } else {
+                    LlmJsonStream::new(futures_util::stream::empty())
+                })
+            })
+        }))
+        .collector(Box::new(|_| Ok(())))
+        .finalizer(finalizer)
+        .parent_opt(prep.parent.clone())
+        .attributes(prep.attributes)
+        .build();
+    let stream = TASK_SCOPE_STACK
+        .scope(
+            prep.scope_stack.clone(),
+            execute_gateway_stream(params, observer),
+        )
+        .await
+        .unwrap();
+    (stream, ready)
 }
 
 #[test]
@@ -2583,9 +2902,12 @@ fn streaming_gateway_call_guard_finishes_without_a_current_runtime() {
         (manager, prep)
     });
     let final_response = json!({ "output_text": "streamed final" });
-    let stream = LlmJsonStream::new(futures_util::stream::pending::<
-        std::result::Result<Value, FlowError>,
-    >());
+    let (stream, ready) = runtime.block_on(managed_final_response_stream(
+        &manager,
+        &prep,
+        final_response.clone(),
+        true,
+    ));
     let body = client_sse_body(
         stream,
         ProviderRoute::OpenAiResponses,
@@ -2593,7 +2915,7 @@ fn streaming_gateway_call_guard_finishes_without_a_current_runtime() {
             manager.clone(),
             prep.session_id,
             prep.owner_subagent_id,
-            Arc::new(Mutex::new(Some(final_response.clone()))),
+            Some(ready),
             prep.session_finish,
             crate::operational::OperationalContext::new(),
         ),
@@ -2664,9 +2986,8 @@ async fn streaming_body_records_final_response_for_turn_output() {
     let session_id = prep.session_id.clone();
     let owner_subagent_id = prep.owner_subagent_id.clone();
     let final_response = json!({ "output_text": "streamed final" });
-    let stream = LlmJsonStream::new(futures_util::stream::empty::<
-        std::result::Result<Value, FlowError>,
-    >());
+    let (stream, ready) =
+        managed_final_response_stream(&manager, &prep, final_response.clone(), false).await;
     let body = client_sse_body(
         stream,
         ProviderRoute::OpenAiResponses,
@@ -2674,7 +2995,7 @@ async fn streaming_body_records_final_response_for_turn_output() {
             manager.clone(),
             session_id,
             owner_subagent_id,
-            Arc::new(Mutex::new(Some(final_response.clone()))),
+            Some(ready),
             prep.session_finish,
             crate::operational::OperationalContext::new(),
         ),
@@ -2826,8 +3147,13 @@ async fn models_refuses_an_unusable_named_upstream() {
         // would be sent here instead of failing.
         openai_base_url: "http://127.0.0.1:1".into(),
         openai_auth_header: None,
+        openai_api_key: None,
+        openai_api_key_helper: None,
         anthropic_base_url: "http://127.0.0.1:1".into(),
         anthropic_auth_header: None,
+        anthropic_api_key: None,
+        anthropic_api_key_helper: None,
+        chatgpt_codex_base_url: None,
         metadata: None,
         plugin_config: None,
         max_hook_payload_bytes: crate::configuration::DEFAULT_MAX_HOOK_PAYLOAD_BYTES,
@@ -2844,11 +3170,16 @@ async fn models_refuses_an_unusable_named_upstream() {
         ),
         http: test_http_client(),
         http_no_redirect: test_http_client_no_redirect(),
+        http_helper: test_http_client_no_redirect(),
         sessions: SessionManager::new(config),
         last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        active_websockets: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         bootstrap_shutdown: None,
         instance_id: "test-instance".into(),
         bootstrap_tls: None,
+        bootstrap_handshake_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            crate::server::MAX_CONCURRENT_TLS_HANDSHAKES,
+        )),
         local_address: None,
     };
     let request = Request::builder()
@@ -2872,4 +3203,667 @@ async fn models_refuses_an_unusable_named_upstream() {
         matches!(error, crate::error::CliError::InvalidPayload(_)),
         "a named destination that cannot be used must fail the request: {error}"
     );
+}
+
+#[test]
+fn unmanaged_provider_routes_use_codex_auth_routing_and_preserve_query() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        HeaderValue::from_static("Bearer at-codex-voice"),
+    );
+    headers.insert(
+        "chatgpt-account-id",
+        axum::http::HeaderValue::from_static("test-account"),
+    );
+    for (route, path, expected) in [
+        (
+            ProviderRoute::OpenAiImagesEdits,
+            "/images/edits?trace=opaque%2Fquery",
+            "https://chatgpt.com/backend-api/codex/images/edits?trace=opaque%2Fquery",
+        ),
+        (
+            ProviderRoute::OpenAiImagesEdits,
+            "/v1/images/edits?trace=opaque%2Fquery",
+            "https://chatgpt.com/backend-api/codex/images/edits?trace=opaque%2Fquery",
+        ),
+        (
+            ProviderRoute::OpenAiMemoriesSummarize,
+            "/memories/trace_summarize?trace=opaque%2Fquery",
+            "https://chatgpt.com/backend-api/codex/memories/trace_summarize?trace=opaque%2Fquery",
+        ),
+        (
+            ProviderRoute::OpenAiMemoriesSummarize,
+            "/v1/memories/trace_summarize?trace=opaque%2Fquery",
+            "https://chatgpt.com/backend-api/codex/memories/trace_summarize?trace=opaque%2Fquery",
+        ),
+        (
+            ProviderRoute::OpenAiStandaloneSearch,
+            "/alpha/search?trace=opaque%2Fquery",
+            "https://chatgpt.com/backend-api/codex/alpha/search?trace=opaque%2Fquery",
+        ),
+        (
+            ProviderRoute::OpenAiStandaloneSearch,
+            "/v1/alpha/search?trace=opaque%2Fquery",
+            "https://chatgpt.com/backend-api/codex/alpha/search?trace=opaque%2Fquery",
+        ),
+        (
+            ProviderRoute::OpenAiRealtimeCalls,
+            "/realtime/calls?model=voice",
+            "https://chatgpt.com/backend-api/codex/realtime/calls?model=voice",
+        ),
+        (
+            ProviderRoute::OpenAiRealtimeCalls,
+            "/v1/realtime/calls?model=voice",
+            "https://chatgpt.com/backend-api/codex/realtime/calls?model=voice",
+        ),
+        (
+            ProviderRoute::OpenAiRealtimeCalls,
+            "/backend-api/codex/realtime/calls?model=voice",
+            "https://chatgpt.com/backend-api/codex/realtime/calls?model=voice",
+        ),
+        (
+            ProviderRoute::OpenAiResponsesCompact,
+            "/responses/compact?model=voice",
+            "https://chatgpt.com/backend-api/codex/responses/compact?model=voice",
+        ),
+        (
+            ProviderRoute::OpenAiResponsesCompact,
+            "/v1/responses/compact?model=voice",
+            "https://chatgpt.com/backend-api/codex/responses/compact?model=voice",
+        ),
+        (
+            ProviderRoute::OpenAiResponsesCompact,
+            "/backend-api/codex/responses/compact?model=voice",
+            "https://chatgpt.com/backend-api/codex/responses/compact?model=voice",
+        ),
+    ] {
+        assert_eq!(
+            gateway_upstream_url_override_with_openai_key_state(route, &headers, path, false,)
+                .as_deref(),
+            Some(expected),
+        );
+        assert_eq!(
+            gateway_upstream_url_override_with_openai_key_state(route, &headers, path, true,),
+            path.starts_with("/backend-api/codex/realtime/calls")
+                .then(|| expected.to_owned()),
+        );
+    }
+}
+
+#[test]
+fn chatgpt_routes_use_the_configured_chatgpt_base() {
+    let chatgpt_only = GatewayConfig {
+        chatgpt_codex_base_url: Some("https://chatgpt-proxy.example/codex".into()),
+        ..GatewayConfig::default()
+    };
+    let with_replacement = GatewayConfig {
+        openai_auth_header: Some("Bearer api-replacement".into()),
+        chatgpt_codex_base_url: Some("https://chatgpt-proxy.example/codex/".into()),
+        ..GatewayConfig::default()
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        HeaderValue::from_static("Bearer at-codex-token"),
+    );
+    headers.insert(
+        "chatgpt-account-id",
+        axum::http::HeaderValue::from_static("test-account"),
+    );
+
+    assert_eq!(
+        gateway_upstream_url_override(
+            ProviderRoute::OpenAiResponses,
+            &headers,
+            "/v1/responses?client=codex",
+            false,
+            &chatgpt_only,
+        )
+        .as_deref(),
+        Some("https://chatgpt-proxy.example/codex/responses?client=codex"),
+    );
+    // A replacement credential still sends Responses to `openai_base_url`, not the ChatGPT base.
+    assert_eq!(
+        gateway_upstream_url_override(
+            ProviderRoute::OpenAiResponses,
+            &headers,
+            "/v1/responses?client=codex",
+            true,
+            &with_replacement,
+        ),
+        None,
+    );
+    assert_eq!(
+        gateway_upstream_url_override(
+            ProviderRoute::OpenAiRealtimeCalls,
+            &headers,
+            "/backend-api/codex/realtime/calls?model=voice",
+            true,
+            &with_replacement,
+        )
+        .as_deref(),
+        Some("https://chatgpt-proxy.example/codex/realtime/calls?model=voice"),
+    );
+}
+
+#[tokio::test]
+async fn backend_voice_call_preserves_chatgpt_auth_despite_configured_api_replacement() {
+    let config = GatewayConfig {
+        openai_auth_header: Some("Bearer api-replacement".into()),
+        ..GatewayConfig::default()
+    };
+    let path = "/backend-api/codex/realtime/calls";
+    let body = r#"{"sdp":"offer","session":{"type":"realtime"}}"#;
+    let request = Request::post(format!("{path}?architecture=avas"))
+        .header("authorization", "Bearer at-chatgpt-voice")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let prepared = prepare_gateway_request(&config, request, environment_authorization(), path)
+        .await
+        .unwrap();
+    assert_eq!(
+        prepared.upstream_url,
+        "https://chatgpt.com/backend-api/codex/realtime/calls?architecture=avas"
+    );
+    assert_eq!(prepared.headers["authorization"], "Bearer at-chatgpt-voice");
+    assert_eq!(prepared.body_bytes.as_ref(), body.as_bytes());
+    assert!(!prepared.authorization.allow_environment_provider_auth);
+    let forwarded =
+        daemon_provider_forward_headers_with_access(&prepared.headers, path, &config, true)
+            .unwrap();
+    assert_eq!(forwarded["authorization"], "Bearer at-chatgpt-voice");
+}
+
+#[tokio::test]
+async fn voice_connections_preserve_configured_upstream_and_chatgpt_credentials() {
+    for base in [
+        "https://api.openai.com/v1",
+        "https://voice.example/proxy/v1",
+    ] {
+        for replacement in [None, Some("Bearer administrator-key".to_string())] {
+            let config = GatewayConfig {
+                openai_base_url: base.to_owned(),
+                openai_auth_header: replacement,
+                ..GatewayConfig::default()
+            };
+            for path in [
+                "/v1/live",
+                "/live",
+                "/v1/live/rtc_test",
+                "/v1/live/sessions",
+                "/v1/live/sessions/live_test/attach",
+                "/v1/realtime",
+                "/realtime",
+            ] {
+                let query = "intent=quicksilver&call_id=rtc_test";
+                let request = Request::get(format!("{path}?{query}"))
+                    .header("authorization", "Bearer at-chatgpt-voice")
+                    .body(Body::empty())
+                    .unwrap();
+                let prepared =
+                    prepare_gateway_request(&config, request, environment_authorization(), path)
+                        .await
+                        .unwrap();
+                let suffix = path.strip_prefix("/v1").unwrap_or(path);
+                let expected = format!("{base}{suffix}?{query}");
+                assert_eq!(prepared.upstream_url, expected);
+                assert_eq!(prepared.headers["authorization"], "Bearer at-chatgpt-voice");
+                let daemon_url = daemon_provider_upstream_url_with_access(
+                    &prepared.headers,
+                    &format!("{path}?{query}"),
+                    &config,
+                    true,
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(daemon_url, expected);
+                let headers = daemon_provider_forward_headers_with_access(
+                    &prepared.headers,
+                    path,
+                    &config,
+                    true,
+                )
+                .unwrap();
+                assert_eq!(headers["authorization"], "Bearer at-chatgpt-voice");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn helper_authentication_reaches_gateway_upstream_on_each_dispatch() {
+    use axum::{Router, routing::post};
+    let seen = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
+    let capture = seen.clone();
+    let app = Router::new().route(
+        "/",
+        post(move |headers: HeaderMap| {
+            let capture = capture.clone();
+            async move {
+                capture.lock().unwrap().push(headers);
+                "{}"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let config = GatewayConfig {
+        openai_api_key_helper: Some(crate::upstream_auth::tests::helper("printf 'token-%s' $$")),
+        anthropic_api_key_helper: Some(crate::upstream_auth::tests::helper("printf 'token-%s' $$")),
+        ..GatewayConfig::default()
+    };
+    let http = test_http_client();
+    let inbound = HeaderMap::from_iter([(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer inbound"),
+    )]);
+    for route in [
+        ProviderRoute::OpenAiResponses,
+        ProviderRoute::AnthropicMessages,
+        ProviderRoute::OpenAiModels,
+        ProviderRoute::AnthropicModels,
+    ] {
+        let forwarding = ProviderForwarding::new(
+            route,
+            crate::provider_auth::ProviderRequestAuthorization {
+                source_credential:
+                    crate::provider_auth::SourceCredentialDisposition::ProviderCredential,
+                allow_environment_provider_auth: true,
+            },
+            &config,
+        );
+        for streaming in [false, true] {
+            let response = forward_upstream_request(
+                &http,
+                &http,
+                UpstreamForwardRequest {
+                    method: &Method::POST,
+                    url: &url,
+                    body_bytes: &Bytes::from_static(b"{}"),
+                    headers: &inbound,
+                    effective_request: None,
+                    source_body: None,
+                    forwarding: forwarding.clone(),
+                    operational: None,
+                    streaming,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+    let captured = seen.lock().unwrap();
+    assert_eq!(captured.len(), 8);
+    assert_ne!(captured[0]["authorization"], captured[1]["authorization"]);
+    assert_ne!(captured[2]["x-api-key"], captured[3]["x-api-key"]);
+    assert!(!captured[2].contains_key("authorization"));
+    assert_ne!(captured[4]["authorization"], captured[5]["authorization"]);
+    assert_ne!(captured[6]["x-api-key"], captured[7]["x-api-key"]);
+    assert!(!captured[6].contains_key("authorization"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_models_static_key_replaces_caller_oauth() {
+    use axum::{Router, routing::get};
+    let _env = crate::test_support::EnvScope::set(&[("OPENAI_API_KEY", None)]);
+    let seen = Arc::new(Mutex::new(None::<HeaderMap>));
+    let capture = seen.clone();
+    let app = Router::new().route(
+        "/v1/models",
+        get(move |headers: HeaderMap| {
+            let capture = capture.clone();
+            async move {
+                *capture.lock().unwrap() = Some(headers);
+                "{}"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = GatewayConfig {
+        openai_base_url: format!("http://{}", listener.local_addr().unwrap()),
+        openai_api_key: Some("static-openai-key".into()),
+        ..GatewayConfig::default()
+    };
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut state = AppState::new(config);
+    state.require_provider_client_token = false;
+    let response = models(
+        State(state),
+        Request::get("/v1/models")
+            .header("authorization", "Bearer at-private-chatgpt-oauth")
+            .header("chatgpt-account-id", "test-account")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let actual = seen.lock().unwrap().as_ref().unwrap()["authorization"].clone();
+    server.abort();
+    assert_eq!(
+        actual, "Bearer static-openai-key",
+        "Managed model discovery must use the configured replacement credential"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn regression_anthropic_helper_preserves_openai_redirect_rejection() {
+    use axum::{Router, response::Redirect, routing::get};
+    let _env = crate::test_support::EnvScope::set(&[("OPENAI_API_KEY", None)]);
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Redirect::temporary("/real-models") }),
+        )
+        .route("/real-models", get(|| async { "{}" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for helper_enabled in [false, true] {
+        let config = GatewayConfig {
+            openai_base_url: base_url.clone(),
+            anthropic_api_key_helper: helper_enabled
+                .then(|| crate::upstream_auth::tests::helper("printf anthropic-only-key")),
+            ..GatewayConfig::default()
+        };
+        let response = models(
+            State(AppState::new(config)),
+            Request::get("/v1/models").body(Body::empty()).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "Anthropic helper={helper_enabled} must not change OpenAI behavior"
+        );
+    }
+    server.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn regression_native_chatgpt_voice_retains_its_credentials_with_helper() {
+    let config = GatewayConfig {
+        openai_api_key_helper: Some(crate::upstream_auth::tests::helper("exit 9")),
+        chatgpt_codex_base_url: Some("https://chatgpt-proxy.example/codex".into()),
+        ..GatewayConfig::default()
+    };
+    let path = "/backend-api/codex/realtime/calls";
+    let request = Request::post(path)
+        .header("authorization", "Bearer at-chatgpt-voice")
+        .body(Body::from("{}"))
+        .unwrap();
+    let prepared = prepare_gateway_request(&config, request, environment_authorization(), path)
+        .await
+        .unwrap();
+    assert_eq!(
+        prepared.upstream_url,
+        "https://chatgpt-proxy.example/codex/realtime/calls"
+    );
+    assert_eq!(prepared.headers["authorization"], "Bearer at-chatgpt-voice");
+    assert!(!prepared.authorization.allow_environment_provider_auth);
+    assert!(!daemon_allows_provider_auth(
+        &prepared.headers,
+        path,
+        &config
+    ));
+    assert_eq!(
+        daemon_provider_upstream_url(&prepared.headers, path, &config)
+            .unwrap()
+            .unwrap(),
+        prepared.upstream_url
+    );
+    let forwarded =
+        daemon_provider_forward_headers_with_access(&prepared.headers, path, &config, true)
+            .unwrap();
+    assert_eq!(forwarded["authorization"], "Bearer at-chatgpt-voice");
+}
+
+#[tokio::test]
+async fn prepared_gateway_request_strips_untrusted_dispatch_controls() {
+    let controls = [
+        (
+            INTERNAL_DISPATCH_URL_HEADER,
+            "http://attacker.invalid/v1/responses",
+        ),
+        (INTERNAL_DISPATCH_ROUTE_HEADER, "openai_responses"),
+        (INTERNAL_DISPATCH_BACKEND_HEADER, "attacker-backend"),
+        (INTERNAL_RETRY_AWARE_HEADER, "true"),
+    ];
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions");
+    let mut wire_headers = HeaderMap::new();
+    for (name, value) in controls {
+        builder = builder.header(name, value);
+        wire_headers.insert(name, HeaderValue::from_static(value));
+        assert!(!should_record_header(
+            &HeaderName::from_static(name),
+            &wire_headers
+        ));
+    }
+    let prepared = prepare_gateway_request(
+        &GatewayConfig::default(),
+        builder.body(Body::from(r#"{"model":"gpt-test"}"#)).unwrap(),
+        environment_authorization(),
+        "/v1/chat/completions",
+    )
+    .await
+    .unwrap();
+    let mut start = build_llm_gateway_start(&prepared);
+    for (name, _) in controls {
+        assert!(!prepared.headers.contains_key(name));
+        assert!(!start.request.headers.contains_key(name));
+    }
+    let effective = effective_dispatch_request(
+        &prepared.body_bytes,
+        &prepared.headers,
+        Some(&start.request),
+        &prepared.upstream_url,
+        prepared.provider,
+        None,
+    );
+    assert_eq!(effective.url, prepared.upstream_url);
+    assert_eq!(effective.target_route, ProviderRoute::OpenAiChatCompletions);
+    // Trusted middleware can still choose an upstream after headers are recorded.
+    start.request.headers.insert(
+        INTERNAL_DISPATCH_URL_HEADER.to_string(),
+        json!("http://trusted.invalid/v1/chat/completions"),
+    );
+    let effective = effective_dispatch_request(
+        &prepared.body_bytes,
+        &prepared.headers,
+        Some(&start.request),
+        &prepared.upstream_url,
+        prepared.provider,
+        None,
+    );
+    assert_eq!(effective.url, "http://trusted.invalid/v1/chat/completions");
+}
+
+#[tokio::test]
+async fn unmanaged_routes_never_inject_configured_or_environment_credentials() {
+    let _env = crate::test_support::EnvScope::set(&[(
+        "OPENAI_API_KEY",
+        Some(std::ffi::OsStr::new("relay-environment-secret")),
+    )]);
+    let configs = [
+        GatewayConfig::default(),
+        GatewayConfig {
+            openai_auth_header: Some("Bearer relay-configured-secret".into()),
+            ..GatewayConfig::default()
+        },
+        GatewayConfig {
+            openai_api_key: Some("relay-static-secret".into()),
+            ..GatewayConfig::default()
+        },
+        GatewayConfig {
+            openai_api_key_helper: Some(crate::upstream_auth::ApiKeyHelper {
+                command: "unmanaged-route-helper-must-not-run".into(),
+                args: Vec::new(),
+                timeout_ms: 1000,
+                auth_scheme: None,
+            }),
+            ..GatewayConfig::default()
+        },
+    ];
+    for route in [
+        ProviderRoute::OpenAiResponsesCompact,
+        ProviderRoute::OpenAiRealtime,
+        ProviderRoute::OpenAiRealtimeCalls,
+        ProviderRoute::OpenAiLive,
+        ProviderRoute::OpenAiImagesGenerations,
+        ProviderRoute::OpenAiImagesEdits,
+        ProviderRoute::OpenAiMemoriesSummarize,
+        ProviderRoute::OpenAiStandaloneSearch,
+    ] {
+        for config in &configs {
+            let request = inject_provider_auth(
+                test_http_client().post("http://upstream"),
+                route,
+                true,
+                config,
+            )
+            .await
+            .unwrap();
+            assert!(
+                !crate::provider_auth::has_provider_credential(request.headers()),
+                "{route:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn source_request_body_moves_original_storage_and_does_not_live_with_event_codecs() {
+    let codecs = codecs_for_route(ProviderRoute::OpenAiResponses);
+    let codec = Arc::clone(codecs.request.as_ref().unwrap());
+    let original = LlmRequest {
+        headers: Map::new(),
+        content: json!({"model": "gpt-test", "input": "original request text"}),
+    };
+    let text_ptr = original.content["input"].as_str().unwrap().as_ptr();
+    let baseline = codec.decode(&original).unwrap();
+    let encoded = codec
+        .encode_owned_with_baseline(&baseline, original, &baseline)
+        .unwrap();
+    assert!(codecs.source_body.matches(&encoded.content));
+    assert_eq!(
+        codecs.source_body.0.get().unwrap()["input"]
+            .as_str()
+            .unwrap()
+            .as_ptr(),
+        text_ptr
+    );
+    let source = Arc::downgrade(&codecs.source_body.0);
+    drop(codecs);
+    assert!(source.upgrade().is_none());
+    // Retaining a codec for queued event processing must not retain the source body.
+    assert_eq!(codec.decode(&encoded).unwrap(), baseline);
+}
+
+#[tokio::test]
+async fn custom_upstream_routes_apply_managed_or_passthrough_auth_policy() {
+    use base64::Engine;
+    let _env = crate::test_support::EnvScope::set(&[("OPENAI_API_KEY", None)]);
+
+    let jwt = |issuer: &str| {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&json!({"iss": issuer})).unwrap());
+        format!("Bearer eyJhbGciOiJSUzI1NiJ9.{payload}.signature")
+    };
+    let chatgpt_jwt = jwt("https://auth.openai.com");
+    let corporate_jwt = jwt("https://login.corporate.example");
+    for (token, is_chatgpt) in [
+        (chatgpt_jwt.as_str(), true),
+        ("Bearer at-chatgpt-test", true),
+        (corporate_jwt.as_str(), false),
+        ("Bearer sk-caller-key", false),
+    ] {
+        for base in ["https://gateway.example/v1", "https://api.openai.com/v1"] {
+            for configured in [None, Some("Bearer configured-key")] {
+                let config = GatewayConfig {
+                    openai_base_url: base.into(),
+                    openai_auth_header: configured.map(str::to_owned),
+                    ..GatewayConfig::default()
+                };
+                for path in [
+                    "/models",
+                    "/v1/models",
+                    "/v1/responses",
+                    "/v1/chat/completions",
+                    "/v1/responses/compact",
+                    "/v1/images/generations",
+                    "/v1/images/edits",
+                    "/v1/memories/trace_summarize",
+                    "/v1/alpha/search",
+                    "/v1/realtime/calls",
+                    "/v1/live/sessions",
+                    "/v1/realtime",
+                    "/backend-api/codex/realtime/calls",
+                ] {
+                    let request = Request::get(format!("{path}?client_version=0.163.0"))
+                        .header("authorization", token)
+                        .header("chatgpt-account-id", "test-account")
+                        .body(Body::empty())
+                        .unwrap();
+                    let wire_headers = request.headers().clone();
+                    let prepared = prepare_gateway_request(
+                        &config,
+                        request,
+                        environment_authorization(),
+                        path,
+                    )
+                    .await
+                    .unwrap();
+                    let allows_relay_auth = matches!(
+                        path,
+                        "/models" | "/v1/models" | "/v1/responses" | "/v1/chat/completions"
+                    );
+                    let stripped = is_chatgpt
+                        && path != "/backend-api/codex/realtime/calls"
+                        && if allows_relay_auth {
+                            configured.is_some()
+                        } else {
+                            base == "https://gateway.example/v1"
+                        };
+                    assert_eq!(
+                        prepared.headers.contains_key("authorization"),
+                        !stripped,
+                        "{path}"
+                    );
+                    assert_eq!(
+                        prepared.headers.contains_key("chatgpt-account-id"),
+                        !stripped,
+                        "{path}"
+                    );
+                    if !stripped {
+                        assert_eq!(prepared.headers["authorization"], token);
+                    }
+                    let daemon_headers = daemon_provider_forward_headers_with_access(
+                        &wire_headers,
+                        path,
+                        &config,
+                        true,
+                    )
+                    .unwrap();
+                    assert_eq!(daemon_headers, prepared.headers, "{path}");
+                    assert_eq!(
+                        prepared.authorization.allow_environment_provider_auth,
+                        allows_relay_auth
+                    );
+                    assert!(prepared.upstream_url.ends_with("?client_version=0.163.0"));
+                }
+            }
+        }
+    }
 }

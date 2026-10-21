@@ -34,11 +34,16 @@ nemo-relay daemon \
 
 Set `NEMO_RELAY_CLIENT_TOKEN` or create the per-user token file in client
 environments only. Keep an MCP connection active before sending LLM or hook
-requests, including in `--pass-through` mode. Requests without a credential
-header, or with a well-formed credential that is not bound, use pass-through
-without daemon-held provider credentials (unless the daemon runs with
-`--pass-through`). Malformed or repeated credential headers return `401`, and
-`--require-worker` rejects missing and unbound credentials with `401`.
+requests, including in `--pass-through` mode.
+
+Requests with no credential header use pass-through. Requests with a valid
+credential format but no bound route also use pass-through. These requests use
+only provider credentials sent by the client. The exception is a daemon started
+with `--pass-through --bind 127.0.0.1`. With `--bind 0.0.0.0`, anonymous
+requests never receive daemon credentials.
+
+Malformed or repeated credential headers return `401`. The `--require-worker`
+flag rejects missing and unbound credentials with `401`.
 Registered routes without an active MCP reference also use pass-through, or
 return `503` with `--require-worker`. After a daemon
 restart, MCP must register again to restore the route bindings stored in
@@ -178,9 +183,13 @@ Start a daemon that never creates workers with:
 nemo-relay daemon --pass-through
 ```
 
-The daemon still validates a presented route credential, and requests without a
-bound credential also pass through. In this mode only, configured provider
-credentials apply to those requests too. MCP registration can only receive
+The daemon still validates route credentials. Requests without a bound
+credential also pass through. In this mode, they can use the daemon's provider
+credentials only with `--bind 127.0.0.1`. With `--bind 0.0.0.0`, they use
+only provider credentials sent by the client. Requests with a bound route can
+use daemon credentials on either bind address.
+
+MCP registration can only receive
 `UsePassThrough`, and the daemon cannot issue an activation grant or
 accept worker registration. LLM requests use the same streaming transport
 directly to the configured provider. Hook requests return the existing no-op
@@ -270,20 +279,32 @@ nemo-relay daemon hook pi --daemon-address https://relay.example.com:8443 --fail
 The hook process performs the following actions:
 
 1. Reads the agent's native hook payload from standard input.
-2. Resolves the route credential from `NEMO_RELAY_CLIENT_TOKEN`, then from the
-   per-user token file. Without a usable credential it does not contact the
-   daemon: it writes the agent's pass-through response and exits `0`,
-   regardless of the failure policy.
-3. Posts to the existing agent-specific hook path at the daemon root.
+2. Looks for the route credential in `NEMO_RELAY_CLIENT_TOKEN`, then in the
+   user token file. Without a valid credential, it does not contact the daemon.
+   A fail-open hook exits with code `0`. It sends a pass-through response only
+   for named events that do not require a permission check. A fail-closed hook
+   reports an error and exits with code `2`. It does not send an allow response.
+3. Checks the daemon's identity before sending the hook payload. For local
+   HTTP addresses, Relay uses an encrypted TLS connection and trusts only
+   pinned certificates: the saved certificate of the current user account,
+   for a daemon run by the same user, and the certificate an administrator
+   published at `<system config dir>/hook-tls-certificate.pem`, for a daemon
+   run under another account. Without either, the hook fails before it
+   contacts the daemon. For remote HTTPS addresses, Relay checks the
+   certificate against the trusted certificates on your system. It sends the
+   payload to the agent's hook path at the daemon root.
 4. Adds `x-nemo-relay-client-token` exactly once.
 5. Writes a successful, nonempty hook response to standard output without
    changing its bytes.
 
-The hook process does not start a daemon or worker and does not perform an MCP
-handshake. Use `--fail-open` for events that must not block the agent when the
-daemon is unavailable. Use `--fail-closed` for policy events that must reject
-the operation when delivery or evaluation fails. If neither option is present,
-the existing event-specific failure policy applies.
+The hook process does not start a daemon or worker. It does not perform an
+MCP handshake. Use `--fail-open` for events that must not block the agent
+when the daemon is unavailable. Use `--fail-closed` to block an operation
+when Relay cannot deliver or check its hook.
+
+Without a policy flag, the event determines the failure policy. Hooks fail
+closed if Relay cannot read the payload, parse its JSON, or find an event
+name. Restart the daemon after upgrading to use the new local hook transport.
 
 
 ## Manage the Client Token File
@@ -301,6 +322,34 @@ overwrites an invalid or unsafe file. It never prints the token. With `--json`,
 standard output is `{"status":"created"|"existing","path":"..."}`. See
 [Credential Resolution](/daemon/configuration#credential-resolution) for the
 resolution order and file safety checks.
+
+## Publish the Hook Certificate
+
+Print the certificate that a daemon run by the current account presents to
+hooks:
+
+```text
+nemo-relay daemon tls-certificate
+```
+
+Standard output is one PEM `CERTIFICATE` block. The private key is never
+printed. The command creates the identity the same way daemon startup does, so
+it can run before or after the daemon first starts. Run it as the daemon's
+account, with the same `HOME` and `XDG_CONFIG_HOME` as the service.
+
+When the daemon runs under a different account than the coding agents, install
+the output as `hook-tls-certificate.pem` in the system configuration directory
+(`/etc/nemo-relay` on Unix, `%ProgramData%\nemo-relay` on Windows). On Unix, the
+file and its directory must be owned by root and must not be writable by group
+or other users, or hooks refuse it. The platform guides show the commands for a
+[macOS LaunchDaemon](/daemon/macos#system-launchdaemon),
+[Linux system service](/daemon/linux#system-service), and
+[Windows task or service](/daemon/windows#publish-the-hook-certificate).
+
+This certificate applies only to a daemon reached at a plain `http://` loopback
+address. A daemon started with `--tls-cert` and `--tls-key` serves that
+certificate at an `https://` address instead, and hooks verify it through the
+platform trust store, so there is nothing to publish.
 
 ## Run a Daemon-Attached Worker
 
@@ -460,10 +509,9 @@ They do not include credentials or hook payloads.
 
 ## Preserve Streaming Responses
 
-The daemon, worker, and pass-through paths use Hyper to stream responses from
-provider to client. They forward bytes as the client reads them, without waiting
-for a successful LLM response to finish. The transport preserves these response
-details:
+By default, Relay sends provider responses to the client as they arrive. It
+preserves the following details unless you configure
+[LLM middleware](#llm-middleware):
 
 - The response status.
 - Ordered, multivalue end-to-end headers.
@@ -491,20 +539,44 @@ worker can still be waiting for middleware or a provider. A worker transport
 failure, response-body failure, or explicit route rejection triggers control
 recovery before worker forwarding resumes.
 
-The worker also sends request bodies directly through the pooled Hyper client
-when no LLM request guardrail, request interceptor, or request-sanitization
-guardrail is registered. If middleware needs the complete JSON request, the
-worker reads and decodes it within a size limit before sending it to the
-provider. It does not collect response bodies for that check.
+Middleware that needs a complete request must read it within the configured
+request body size limit.
 
-Relay preserves the stream delivered to the caller. Do not use daemon-worker
-mode with middleware that must change, hide, or replace successful streaming
-response events. Observers and caches must read a separate copy with a size
-limit. If an observer falls behind, its copy can be incomplete. It must never
-delay or change the caller's stream.
+### LLM Middleware
 
-The worker captures at most 4 MiB per streamed response for semantic
-observation by default. Set
+Daemon workers support all LLM middleware types for OpenAI Chat Completions,
+OpenAI Responses, and Anthropic Messages. This includes calls with and without
+streaming:
+
+- Request intercepts can change a request before Relay sends it to the provider.
+- Conditional execution guardrails can block a call before it reaches the provider.
+- Execution intercepts can change or replace a response, including streaming responses.
+- Request and response sanitizers control the data recorded for observability.
+  They do not change what the provider or client receives.
+
+Agent startup checks, WebSocket connections, and other provider APIs bypass
+LLM middleware.
+
+When you configure request intercepts, execution intercepts, or conditional
+execution guardrails, these response changes apply:
+
+- Successful calls return HTTP `200`. Relay does not keep the provider's original
+  success headers or HTTP trailers.
+- Streaming responses still arrive in parts. Relay does not keep the original
+  formatting, stream comments, heartbeats, event IDs, or retry hints.
+- Provider HTTP errors keep their status, supported headers, and body.
+
+The response-header timeout also includes time spent in middleware. For calls
+without streaming, it includes the wait for the full response. It does not limit
+how long a stream can run after Relay sends its response headers.
+
+Without request intercepts, execution intercepts, or conditional execution
+guardrails, Relay forwards responses unchanged. Observers read
+a separate copy with a size limit. If an observer falls behind, its copy can be
+incomplete. It must never delay or change the client's response.
+
+For responses forwarded unchanged, the worker copies at most 16 MiB per streamed
+response for observability. Set
 `NEMO_RELAY_DAEMON_OBSERVATION_CAPTURE_BYTES` to a positive byte count before
 starting the worker to choose another bound. This setting changes only
 the observation copy. It does not limit, buffer, or cut off the stream delivered
@@ -515,11 +587,16 @@ of the configured provider response-header wait. Exceeding the observation
 deadline marks only the observation copy as incomplete. It does not stop
 the stream delivered to the caller.
 
-The managed worker loads only the administrator's system configuration and
-plugin manifest. It ignores per-user Relay configuration, plugin directories,
-and lifecycle state. Provider secrets can still use their documented
-authentication environment variables. This keeps plugin configuration and
-coding-agent artifact bytes the same across users.
+The managed worker loads the current user's Relay configuration and plugin
+manifest, then merges the administrator's system layer with higher precedence.
+OpenTelemetry endpoint lists concatenate with system endpoints first, so a user
+can add a local trace destination while retaining the system destinations.
+Dynamic plugins use the corresponding user and system lifecycle state. Restart
+the worker after changing configuration to load the new layers.
+
+Provider secrets can still use their documented authentication environment
+variables. Other provider and gateway environment overrides do not apply to
+managed workers.
 
 ### Configure a Trusted Reverse Proxy
 
@@ -608,7 +685,7 @@ Relay and the harness use the following environment variables:
 | `NEMO_RELAY_WORKER_ADVERTISE_ADDRESS` | Managed MCP | Optional concrete worker hostname or IPv4 address reachable by the daemon. |
 | `NEMO_RELAY_WORKER_PORT` | Managed MCP | Optional fixed port from 1 through 65535. Omit it to choose a port automatically. |
 | `NEMO_RELAY_DAEMON_MAX_TOKENS_PER_IDENTITY` | Daemon | Distinct route tokens one machine-user identity may hold, from 1 through 64. Defaults to 4. Used when `--max-tokens-per-identity` is not given; an invalid value stops daemon startup. See [Replace a Client Token](/daemon/configuration#replace-a-client-token). |
-| `NEMO_RELAY_DAEMON_OBSERVATION_CAPTURE_BYTES` | Worker observation | Positive capture limit in bytes. Defaults to 4 MiB and does not limit delivered streams. |
+| `NEMO_RELAY_DAEMON_OBSERVATION_CAPTURE_BYTES` | Worker observation | Positive capture limit in bytes. Defaults to 16 MiB and does not limit delivered streams. |
 | `NEMO_RELAY_LOG` | Operational logger | Explicit log level, such as `info`. Managed MCP and hooks do not discover logging files automatically. |
 | `NEMO_RELAY_LOG_STDERR_FORMAT` | Operational logger | Explicit stderr format, such as `jsonl`. |
 | `XDG_CONFIG_HOME` | Identity-state resolver | First choice for identity state on every platform. Falls back to `HOME/.config`, then `USERPROFILE/.config`. Does not move managed system configuration. |

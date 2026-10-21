@@ -468,19 +468,23 @@ fn control_loss_rejects_new_admissions_without_touching_existing_one() {
     assert_eq!(state.in_flight.load(Ordering::Acquire), 0);
 }
 
-#[test]
-fn configured_provider_auth_never_replaces_caller_auth() {
+#[tokio::test]
+async fn configured_provider_auth_never_replaces_caller_auth() {
     let config = GatewayConfig {
         openai_auth_header: Some("Bearer configured".into()),
         ..GatewayConfig::default()
     };
     let mut headers = HeaderMap::new();
     headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer caller"));
-    inject_provider_auth(&mut headers, ProviderRoute::OpenAi, &config);
+    inject_provider_auth(&mut headers, ProviderRoute::OpenAi, &config)
+        .await
+        .unwrap();
     assert_eq!(headers.get(AUTHORIZATION).expect("auth"), "Bearer caller");
 
     headers.remove(AUTHORIZATION);
-    inject_provider_auth(&mut headers, ProviderRoute::OpenAi, &config);
+    inject_provider_auth(&mut headers, ProviderRoute::OpenAi, &config)
+        .await
+        .unwrap();
     assert_eq!(
         headers.get(AUTHORIZATION).expect("configured auth"),
         "Bearer configured"
@@ -704,8 +708,8 @@ async fn provider_routing_reports_invalid_destinations_and_connection_failures()
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 }
 
-#[test]
-fn provider_auth_supports_both_configured_and_environment_credentials() {
+#[tokio::test]
+async fn provider_auth_supports_both_configured_and_environment_credentials() {
     let _environment = EnvScope::set(&[
         ("OPENAI_API_KEY", Some(std::ffi::OsStr::new(" openai-env "))),
         (
@@ -718,7 +722,9 @@ fn provider_auth_supports_both_configured_and_environment_credentials() {
         &mut openai,
         ProviderRoute::OpenAi,
         &GatewayConfig::default(),
-    );
+    )
+    .await
+    .unwrap();
     assert_eq!(openai[AUTHORIZATION], "Bearer openai-env");
 
     let mut anthropic = HeaderMap::new();
@@ -726,7 +732,9 @@ fn provider_auth_supports_both_configured_and_environment_credentials() {
         &mut anthropic,
         ProviderRoute::Anthropic,
         &GatewayConfig::default(),
-    );
+    )
+    .await
+    .unwrap();
     assert_eq!(anthropic["x-api-key"], "anthropic-env");
 
     let mut configured = HeaderMap::new();
@@ -737,9 +745,10 @@ fn provider_auth_supports_both_configured_and_environment_credentials() {
             anthropic_auth_header: Some("configured-anthropic".into()),
             ..GatewayConfig::default()
         },
-    );
+    )
+    .await
+    .unwrap();
     assert_eq!(configured[AUTHORIZATION], "configured-anthropic");
-    assert!(header_value("bad\nheader").is_none());
 }
 
 #[test]
@@ -913,4 +922,276 @@ async fn monitor_control_rejects_work_and_exits_after_recovery_deadline() {
     .expect("monitor exits after its bounded recovery window");
     assert!(!state.accepting.load(Ordering::Acquire));
     assert!(state.exiting.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn websocket_proxy_authentication_and_drain_release_worker_admission() {
+    use crate::gateway::websocket::tests::{provider, serve};
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let (upstream, provider_task, active) = provider().await;
+    let state = state_with_config(GatewayConfig {
+        openai_base_url: upstream,
+        ..GatewayConfig::default()
+    });
+    let (origin, task) = serve(router(state.clone())).await;
+    let url = format!("{}/v1/live?model=voice", origin.replacen("http", "ws", 1));
+    let error = tokio_tungstenite::connect_async(&url).await.unwrap_err();
+    let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+        panic!("{error}");
+    };
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert(WORKER_TOKEN_HEADER, HeaderValue::from_static("data-secret"));
+    request.headers_mut().insert(
+        AUTHORIZATION,
+        HeaderValue::from_static("Bearer caller-voice-key"),
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    socket.next().await.unwrap().unwrap();
+    assert_eq!(state.in_flight.load(Ordering::SeqCst), 1);
+    state.begin_drain(0);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.in_flight.load(Ordering::SeqCst) != 0 || active.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    provider_task.abort();
+}
+
+#[tokio::test]
+async fn websocket_drain_cancels_a_pending_upstream_handshake() {
+    use crate::gateway::websocket::tests::serve;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let started = Arc::new(Notify::new());
+    let app = axum::Router::new().fallback({
+        let started = Arc::clone(&started);
+        move || {
+            let started = Arc::clone(&started);
+            async move {
+                started.notify_one();
+                std::future::pending::<StatusCode>().await
+            }
+        }
+    });
+    let (upstream, provider_task) = serve(app).await;
+    let state = state_with_config(GatewayConfig {
+        openai_base_url: upstream,
+        ..GatewayConfig::default()
+    });
+    let (origin, task) = serve(router(Arc::clone(&state))).await;
+    let mut request = format!("{}/v1/live", origin.replacen("http", "ws", 1))
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert(WORKER_TOKEN_HEADER, HeaderValue::from_static("data-secret"));
+    let connection = tokio::spawn(tokio_tungstenite::connect_async(request));
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    assert_eq!(state.in_flight.load(Ordering::SeqCst), 1);
+    state.begin_drain(0);
+    let error = tokio::time::timeout(Duration::from_secs(2), connection)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+        panic!("{error}");
+    };
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(state.in_flight.load(Ordering::SeqCst), 0);
+    task.abort();
+    provider_task.abort();
+}
+
+#[test]
+fn managed_provider_transport_failures_preserve_operational_reasons() {
+    use nemo_relay::error::{UpstreamFailure, UpstreamFailureClass};
+    for (class, reason) in [
+        (UpstreamFailureClass::Connection, Some("transport_error")),
+        (UpstreamFailureClass::Timeout, Some("response_head_timeout")),
+        (UpstreamFailureClass::Authentication, None),
+    ] {
+        let error = CliError::ProviderFailure(UpstreamFailure {
+            status: None,
+            body: "provider failure".into(),
+            headers: Default::default(),
+            class,
+        });
+        assert_eq!(managed_upstream_failure_reason(&error), reason);
+    }
+    let error = CliError::UpstreamTransport(
+        crate::daemon::common::transport::TransportError::InsecureDestination,
+    );
+    assert_eq!(
+        managed_upstream_failure_reason(&error),
+        Some("transport_error")
+    );
+}
+
+#[tokio::test]
+async fn unmanaged_routes_forward_only_client_credentials() {
+    let _env = crate::test_support::EnvScope::set(&[(
+        "OPENAI_API_KEY",
+        Some(std::ffi::OsStr::new("relay-environment-secret")),
+    )]);
+    for configured in [None, Some("Bearer relay-owned-secret")] {
+        async fn echo(request: Request<Body>) -> Response<Body> {
+            Response::builder()
+                .status(StatusCode::CREATED)
+                .body(Body::from(
+                    request
+                        .headers()
+                        .get("authorization")
+                        .map_or("absent", |value| value.to_str().unwrap())
+                        .to_owned(),
+                ))
+                .unwrap()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = GatewayConfig {
+            openai_base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
+            chatgpt_codex_base_url: Some(format!("http://{}", listener.local_addr().unwrap())),
+            openai_auth_header: configured.map(str::to_owned),
+            ..GatewayConfig::default()
+        };
+        let provider = axum::Router::new().fallback(echo);
+        let task = tokio::spawn(async move { axum::serve(listener, provider).await.unwrap() });
+        let app = router(state_with_config(config));
+        for path in [
+            "/v1/responses/compact",
+            "/v1/images/generations",
+            "/v1/realtime/calls",
+            "/v1/live/sessions",
+            "/v1/images/edits",
+            "/v1/alpha/search",
+            "/v1/memories/trace_summarize",
+        ] {
+            for credential in [
+                None,
+                Some("Bearer caller-key"),
+                Some("Bearer eyJhbGciOiJIUzI1NiJ9.deadbeef.signature"),
+            ] {
+                let mut request = Request::post(path)
+                    .header("content-type", "application/json")
+                    .header("x-nemo-relay-worker-token", "data-secret");
+                if let Some(credential) = credential {
+                    request = request.header("authorization", credential);
+                }
+                let request = request.body(Body::from("{}")).unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::CREATED, "{path}");
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(
+                    bytes.as_ref(),
+                    credential.unwrap_or("absent").as_bytes(),
+                    "{path}"
+                );
+            }
+        }
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn model_catalog_workers_keep_provider_credentials_on_the_selected_upstream() {
+    let _plugins = crate::test_support::PLUGIN_CONFIG_TEST_LOCK.lock().await;
+    let _env = EnvScope::set(&[
+        (
+            "OPENAI_API_KEY",
+            Some(std::ffi::OsStr::new("environment-openai")),
+        ),
+        (
+            "ANTHROPIC_API_KEY",
+            Some(std::ffi::OsStr::new("environment-anthropic")),
+        ),
+    ]);
+    async fn upstream(name: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().fallback(move |request: Request<Body>| async move {
+            Json(json!({
+                "provider": name,
+                "authorization": request.headers().get("authorization").map(|v| v.to_str().unwrap()),
+                "key": request.headers().get("x-api-key").map(|v| v.to_str().unwrap()),
+                "uri": request.uri().to_string(),
+            }))
+        });
+        (
+            base,
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+        )
+    }
+    let (openai, openai_task) = upstream("openai").await;
+    let (anthropic, anthropic_task) = upstream("anthropic").await;
+    for configured in [false, true] {
+        let config = GatewayConfig {
+            openai_base_url: format!("{openai}/v1"),
+            anthropic_base_url: anthropic.clone(),
+            openai_auth_header: configured.then(|| "Bearer configured-openai".into()),
+            anthropic_auth_header: configured.then(|| "Bearer configured-anthropic".into()),
+            ..GatewayConfig::default()
+        };
+        for managed in [false, true] {
+            let mut state = state_with_config(config.clone());
+            if managed {
+                Arc::get_mut(&mut state).unwrap().managed = Some(
+                    ManagedRuntime::initialize(
+                        config.clone(),
+                        Vec::new(),
+                        "model-catalog-test".into(),
+                    )
+                    .await
+                    .unwrap()
+                    .into(),
+                );
+            }
+            let app = router(state.clone());
+            for provider in ["openai", "anthropic"] {
+                for path in ["/models", "/v1/models"] {
+                    let mut request = Request::get(format!("{path}?limit=1"))
+                        .header(WORKER_TOKEN_HEADER, "data-secret");
+                    if provider == "anthropic" {
+                        request = request.header("anthropic-version", "2023-06-01");
+                    }
+                    let response = app
+                        .clone()
+                        .oneshot(request.body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let body = response.into_body().collect().await.unwrap().to_bytes();
+                    let observed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(observed["provider"], provider, "managed={managed}");
+                    assert_eq!(observed["uri"], "/v1/models?limit=1");
+                    let auth = if configured {
+                        Some(format!("Bearer configured-{provider}"))
+                    } else {
+                        (provider == "openai").then(|| "Bearer environment-openai".into())
+                    };
+                    assert_eq!(observed["authorization"], json!(auth));
+                    assert_eq!(
+                        observed["key"],
+                        json!(
+                            (!configured && provider == "anthropic")
+                                .then_some("environment-anthropic")
+                        )
+                    );
+                }
+            }
+            if let Some(runtime) = &state.managed {
+                runtime.close().await.unwrap();
+            }
+        }
+    }
+    openai_task.abort();
+    anthropic_task.abort();
 }

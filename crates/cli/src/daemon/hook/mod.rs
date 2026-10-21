@@ -4,7 +4,6 @@
 //! Managed hook forwarding through an explicitly selected daemon.
 
 use std::io::{Read, Write};
-use std::time::Duration;
 
 use futures_util::StreamExt;
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
@@ -15,12 +14,11 @@ use crate::daemon::common::client_token::resolve_route_credential;
 use crate::daemon::common::routes::PublicRoute;
 use crate::daemon::common::state::{ROUTE_TOKEN_ENV, RouteCredential};
 use crate::error::CliError;
-use crate::hooks::HookFailurePolicy;
+use crate::hooks::{HOOK_FORWARD_TIMEOUT, HookFailurePolicy, effective_fail_closed};
 use crate::operational::{self, OperationalContext};
 
 pub(crate) const CLIENT_TOKEN_ENV: &str = ROUTE_TOKEN_ENV;
 const CLIENT_TOKEN_HEADER: &str = crate::configuration::BOOTSTRAP_CLIENT_TOKEN_HEADER;
-const HOOK_FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_HOOK_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -32,8 +30,9 @@ pub(crate) struct Options {
 
 /// Reads one native hook payload, sends it to the daemon, and relays the response to stdout.
 ///
-/// Without a usable route credential the daemon is not contacted: the hook emits the daemon's own
-/// pass-through response for the agent and succeeds, regardless of the failure policy.
+/// Without a usable route credential the daemon is not contacted: fail-closed hooks report a
+/// delivery failure. Fail-open hooks emit the daemon's pass-through response only for
+/// named events that do not require a permission check.
 pub(crate) async fn run(options: Options) -> Result<(), CliError> {
     let credential = resolve_route_credential().map(|resolved| resolved.credential);
     run_with(
@@ -54,7 +53,20 @@ async fn run_with(
     let operational = OperationalContext::new();
     operational::hook_started(&operational, "daemon_hook_forward");
     let payload = read_hook_payload_with_context(input, &operational);
+    let fail_closed = effective_fail_closed(options.failure_policy, payload.as_deref().ok());
     let Some(credential) = credential else {
+        if fail_closed {
+            let error = CliError::Unauthorized(format!(
+                "No NeMo Relay client credential is available; set {CLIENT_TOKEN_ENV} or run `nemo-relay daemon token ensure`"
+            ));
+            operational::hook_failed(
+                &operational,
+                "daemon_hook_forward",
+                error.log_kind(),
+                fail_closed,
+            );
+            return handle_delivery_failure(error, fail_closed);
+        }
         log::warn!(
             target: "nemo_relay.hook",
             event = "daemon_hook_pass_through",
@@ -62,11 +74,12 @@ async fn run_with(
             reason = "missing_credential";
             "No NeMo Relay client credential is available; the hook passes through without daemon delivery"
         );
-        output.write_all(pass_through_body(options.agent))?;
+        if !crate::hooks::payload_requires_fail_closed(payload.as_deref().ok()) {
+            output.write_all(pass_through_body(options.agent))?;
+        }
         operational::hook_completed(&operational, "daemon_hook_forward", "pass_through");
         return Ok(());
     };
-    let fail_closed = effective_fail_closed(options.failure_policy, payload.as_deref().ok());
     let result: Result<(), CliError> = async {
         let token = route_token_header(&credential)?;
         let payload = payload?;
@@ -104,27 +117,6 @@ fn pass_through_body(agent: CodingAgent) -> &'static [u8] {
     match PublicRoute::from_path(agent.hook_path()) {
         Some(PublicRoute::Hook(hook)) => hook.pass_through_body(),
         _ => b"{}",
-    }
-}
-
-fn effective_fail_closed(policy: HookFailurePolicy, payload: Option<&[u8]>) -> bool {
-    match policy {
-        HookFailurePolicy::FailOpen => false,
-        HookFailurePolicy::FailClosed => true,
-        HookFailurePolicy::Default => {
-            if policy.fail_closed() {
-                return true;
-            }
-            payload
-                .and_then(|payload| serde_json::from_slice::<Value>(payload).ok())
-                .and_then(|payload| {
-                    ["hook_event_name", "event_name", "event", "type"]
-                        .into_iter()
-                        .find_map(|name| payload.get(name).and_then(Value::as_str))
-                        .map(crate::hooks::event_requires_fail_closed)
-                })
-                .unwrap_or(false)
-        }
     }
 }
 
@@ -182,7 +174,40 @@ async fn forward(
     operational: &OperationalContext,
 ) -> Result<Vec<u8>, CliError> {
     let endpoint = hook_endpoint(&options.daemon_address, options.agent)?;
+    if endpoint.scheme() == "http" {
+        let url = options.daemon_address.clone();
+        let path = options.agent.hook_path().to_owned();
+        let headers = vec![
+            (
+                CLIENT_TOKEN_HEADER.to_owned(),
+                token
+                    .to_str()
+                    .map_err(|_| CliError::Config("invalid route token".into()))?
+                    .to_owned(),
+            ),
+            (
+                crate::operational::OPERATION_ID_HEADER.to_owned(),
+                operational.operation_id().to_owned(),
+            ),
+        ];
+        let response = tokio::task::spawn_blocking(move || {
+            crate::gateway::client::post_daemon_verified(
+                &url,
+                &path,
+                &headers,
+                &payload,
+                HOOK_FORWARD_TIMEOUT,
+                MAX_HOOK_RESPONSE_BYTES,
+            )
+        })
+        .await
+        .map_err(|error| CliError::Launch(error.to_string()))?
+        .map_err(|error| CliError::Launch(error.to_string()))?;
+        return handle_response(response.status, response.body);
+    }
+    // HTTPS authenticates remote daemons through the platform trust store.
     let response = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(HOOK_FORWARD_TIMEOUT)
         .build()?
@@ -198,7 +223,11 @@ async fn forward(
         .await?;
     let status = response.status();
     let body = read_response(response, operational).await?;
-    if status.is_success() {
+    handle_response(status.as_u16(), body)
+}
+
+fn handle_response(status: u16, body: Vec<u8>) -> Result<Vec<u8>, CliError> {
+    if (200..300).contains(&status) {
         return Ok(body);
     }
     if let Some(reason) = guardrail_rejection_reason(&body) {

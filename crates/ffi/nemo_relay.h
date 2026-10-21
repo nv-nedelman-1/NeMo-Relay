@@ -2257,6 +2257,94 @@ NemoRelayStatus nemo_relay_otel_metric_subscriber_runtime_diagnostics_json(const
 NemoRelayStatus nemo_relay_otel_metric_subscriber_shutdown(const struct FfiOpenTelemetryMetricSubscriber *subscriber);
 
 /**
+ * Creates an OTLP subscriber with optional TLS file settings.
+ *
+ * `tls_json` accepts a JSON object or a null pointer. The object has three
+ * optional file paths: `certificate`, `client_certificate`, and `private_key`.
+ * Set the client certificate and private key together.
+ * Refer to [`nemo_relay_otel_subscriber_create_with_projection_options_v5`] for the other options.
+ *
+ * # Safety
+ * Any non-null C strings must be valid and `out` must be non-null.
+ */
+NemoRelayStatus nemo_relay_otel_subscriber_create_with_projection_options_with_tls(const char *otel_type,
+                                                                                   const char *transport,
+                                                                                   const char *endpoint,
+                                                                                   const char *headers_json,
+                                                                                   const char *header_env_json,
+                                                                                   const char *resource_attributes_json,
+                                                                                   const char *service_name,
+                                                                                   const char *service_namespace,
+                                                                                   const char *service_version,
+                                                                                   const char *instrumentation_scope,
+                                                                                   uint64_t timeout_millis,
+                                                                                   const char *mark_projection,
+                                                                                   const char *mark_exclude_names_json,
+                                                                                   const char *attribute_mappings_json,
+                                                                                   const char *promote_metadata_prefixes_json,
+                                                                                   const char *promote_resource_metadata_prefixes_json,
+                                                                                   uint64_t completed_span_context_ttl_millis,
+                                                                                   const char *tls_json,
+                                                                                   struct FfiOpenTelemetrySubscriber **out);
+
+/**
+ * Creates an OTLP subscriber with optional TLS file settings.
+ *
+ * `tls_json` accepts a JSON object or a null pointer. The object has three
+ * optional file paths: `certificate`, `client_certificate`, and `private_key`.
+ * Set the client certificate and private key together.
+ * Refer to [`nemo_relay_otel_log_subscriber_create_v2`] for the other options.
+ *
+ * # Safety
+ * Any non-null C strings must be valid and `out` must be non-null.
+ */
+NemoRelayStatus nemo_relay_otel_log_subscriber_create_with_tls(const char *transport,
+                                                               const char *endpoint,
+                                                               const char *headers_json,
+                                                               const char *header_env_json,
+                                                               const char *resource_attributes_json,
+                                                               const char *service_name,
+                                                               const char *service_namespace,
+                                                               const char *service_version,
+                                                               const char *instrumentation_scope,
+                                                               uint64_t timeout_millis,
+                                                               const char *minimum_severity,
+                                                               uint64_t max_queue_size,
+                                                               uint64_t max_export_batch_size,
+                                                               uint64_t scheduled_delay_millis,
+                                                               uint64_t completed_span_context_ttl_millis,
+                                                               const char *tls_json,
+                                                               struct FfiOpenTelemetryLogSubscriber **out);
+
+/**
+ * Creates an OTLP subscriber with optional TLS file settings.
+ *
+ * `tls_json` accepts a JSON object or a null pointer. The object has three
+ * optional file paths: `certificate`, `client_certificate`, and `private_key`.
+ * Set the client certificate and private key together.
+ * Refer to [`nemo_relay_otel_metric_subscriber_create_v2`] for the other options.
+ *
+ * # Safety
+ * Any non-null C strings must be valid and `out` must be non-null.
+ */
+NemoRelayStatus nemo_relay_otel_metric_subscriber_create_with_tls(const char *transport,
+                                                                  const char *endpoint,
+                                                                  const char *headers_json,
+                                                                  const char *header_env_json,
+                                                                  const char *resource_attributes_json,
+                                                                  const char *service_name,
+                                                                  const char *service_namespace,
+                                                                  const char *service_version,
+                                                                  const char *instrumentation_scope,
+                                                                  uint64_t timeout_millis,
+                                                                  uint64_t export_interval_millis,
+                                                                  const char *temporality,
+                                                                  uint64_t max_instruments,
+                                                                  uint64_t cardinality_limit,
+                                                                  const char *tls_json,
+                                                                  struct FfiOpenTelemetryMetricSubscriber **out);
+
+/**
  * Initialize the unified static and dynamic plugin host from core-owned
  * `plugins.toml` discovery.
  *
@@ -3101,6 +3189,17 @@ NemoRelayStatus nemo_relay_scope_register_subscriber(const char *scope_uuid,
  * `scope_uuid` and `name` must be valid C strings.
  */
 NemoRelayStatus nemo_relay_scope_deregister_subscriber(const char *scope_uuid, const char *name);
+
+/**
+ * Return the explicit calling context's root-to-top scope identities as JSON.
+ *
+ * Success with a null output means no active binding. A non-null result must
+ * be released with nemo_relay_string_free. No stack is created or activated.
+ *
+ * # Safety
+ * out must point to valid writable C-string pointer storage.
+ */
+NemoRelayStatus nemo_relay_current_scope_stack_snapshot_json(char **out);
 
 /**
  * Create a new isolated scope stack with its own root scope.

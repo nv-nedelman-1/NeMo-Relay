@@ -333,6 +333,40 @@ async fn transparent_hook_delivery_authenticates_the_wrapper_gateway() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn gateway_hook_transport_waits_for_slow_responses_with_either_failure_policy() {
+    let _plugin_guard = crate::test_support::PLUGIN_CONFIG_TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let _bootstrap_home = BootstrapConfigHome::enter(&temp.path().join("xdg"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = axum::Router::new().route(
+        "/hooks/claude-code",
+        axum::routing::post(|| async {
+            tokio::time::sleep(Duration::from_millis(2_500)).await;
+            r#"{"continue":true}"#
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for policy in [HookFailurePolicy::FailClosed, HookFailurePolicy::FailOpen] {
+        let mut command = hook_request(CodingAgent::ClaudeCode);
+        command.failure_policy = policy;
+        let response = super::delivery::send_hook_forward_request(
+            &command,
+            &format!("http://{address}/hooks/claude-code"),
+            r#"{"hook_event_name":"PreToolUse"}"#.into(),
+            &crate::operational::OperationalContext::new(),
+        )
+        .await
+        .unwrap()
+        .expect("gateway must allow guardrail evaluation longer than two seconds");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), r#"{"continue":true}"#);
+    }
+    server.abort();
+    let _ = server.await;
+}
+
 #[test]
 fn hook_payload_reader_normalizes_blank_input_and_accepts_the_exact_limit() {
     assert_eq!(read_hook_payload_from(" \n\t".as_bytes(), 3).unwrap(), "{}");
@@ -460,6 +494,52 @@ fn hook_response_statuses_preserve_guardrail_rejections_and_fail_closed_errors()
     assert!(error.contains("HTTP 502"), "{error}");
 }
 
+#[tokio::test]
+async fn hook_response_timeouts_respect_failure_policy() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(|| async {
+            std::future::pending::<()>().await;
+            "{}"
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(25))
+        .build()
+        .unwrap();
+    for fail_closed in [false, true] {
+        let error = client
+            .post(format!("http://{address}/hook"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_timeout(), "{error}");
+        let outcome = super::response::handle_hook_forward_response_with_context(
+            Err(error),
+            fail_closed,
+            &crate::operational::OperationalContext::new(),
+        )
+        .await;
+        if fail_closed {
+            assert!(matches!(
+                outcome.unwrap_err(),
+                crate::error::CliError::HookDelivery { .. }
+            ));
+        } else {
+            assert_eq!(
+                outcome.unwrap(),
+                super::response::HookDeliveryOutcome::FailedOpen
+            );
+        }
+    }
+    server.abort();
+    let _ = server.await;
+}
+
 #[test]
 fn merge_hooks_is_idempotent_and_preserves_existing_entries() {
     let existing = json!({
@@ -492,7 +572,7 @@ fn merge_hooks_rejects_malformed_shapes() {
 
 #[test]
 fn helper_formatting_and_headers_cover_optional_paths() {
-    assert!(event_matches_tools("PermissionRequest"));
+    assert!(event_requires_fail_closed("PreToolUse"));
     assert!(!event_matches_tools("SessionStart"));
 
     let headers = gateway_headers(
@@ -604,7 +684,6 @@ fn codex_generation_uses_exactly_the_supported_hook_schema() {
     assert_eq!(
         events,
         std::collections::BTreeSet::from([
-            "PermissionRequest",
             "PostCompact",
             "PostToolUse",
             "PreCompact",
@@ -1000,4 +1079,41 @@ fn claude_windows_hooks_execute_in_bash_with_exact_arguments_and_io() {
             );
         }
     }
+}
+
+#[test]
+fn forwarded_hook_http_errors_preserve_status_and_failure_policy() {
+    use axum::response::IntoResponse;
+    for status in 400..=599 {
+        let status = reqwest::StatusCode::from_u16(status).unwrap();
+        let error = handle_hook_forward_status(status, "backend error".into(), true).unwrap_err();
+        assert_eq!(error.log_kind(), "hook_http");
+        assert!(error.to_string().contains("hook gateway returned HTTP"));
+        assert_eq!(error.into_response().status(), status);
+        handle_hook_forward_status(status, "backend error".into(), false).unwrap();
+    }
+}
+
+#[test]
+fn hook_http_failures_keep_plugin_reporting_context_from_relay_responses() {
+    let message = "upstream provider returned HTTP 403 (Other): Reported by plugin 'nvidia.switchyard': denied";
+    let body =
+        serde_json::json!({"error": {"type": "nemo_relay_gateway_error", "message": message}})
+            .to_string();
+    let error = handle_hook_forward_status(reqwest::StatusCode::FORBIDDEN, body, true).unwrap_err();
+    assert_eq!(error.log_kind(), "hook_http");
+    assert!(error.to_string().contains(message));
+    use axum::response::IntoResponse;
+    assert_eq!(
+        error.into_response().status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+
+    let error = handle_hook_forward_status(
+        reqwest::StatusCode::FORBIDDEN,
+        r#"{"error":{"type":"unknown","message":"do not expose an arbitrary response"}}"#.into(),
+        true,
+    )
+    .unwrap_err();
+    assert!(!error.to_string().contains("do not expose"));
 }

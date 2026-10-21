@@ -551,11 +551,8 @@ fn is_atif_content_part(part: &serde_json::Value) -> bool {
         return false;
     };
     match object.get("type").and_then(serde_json::Value::as_str) {
-        Some("text") => object
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .is_some(),
-        Some("image") => is_atif_image_source(object.get("source")),
+        Some("text") => object.len() == 2 && object.get("text").is_some_and(Json::is_string),
+        Some("image") => object.len() == 2 && is_atif_image_source(object.get("source")),
         _ => false,
     }
 }
@@ -567,10 +564,11 @@ fn is_atif_image_source(value: Option<&serde_json::Value>) -> bool {
     matches!(
         source.get("media_type").and_then(serde_json::Value::as_str),
         Some("image/jpeg" | "image/png" | "image/gif" | "image/webp")
-    ) && source
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .is_some()
+    ) && source.len() == 2
+        && source
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
 }
 
 #[test]
@@ -668,6 +666,72 @@ fn test_exporter_omits_null_tool_observation_content() {
 }
 
 #[test]
+fn test_exporter_projects_versioned_tool_results_without_framework_knowledge() {
+    let exporter = AtifExporter::new("tool-results".to_string(), make_agent_info());
+    let outputs = [
+        json!({"schema": "nemo.relay.tool_result@1", "content": "answer", "is_error": false, "result": {"opaque": 1}}),
+        json!({"schema": "nemo.relay.tool_result@1", "content": [{"type": "text", "text": "failed"}], "is_error": true, "result": {"opaque": 2}}),
+        json!({"schema": "nemo.relay.tool_result@1", "content": null, "is_error": false, "result": {"opaque": 3}}),
+        // A lookalike application object and an unknown version remain opaque.
+        json!({"content": "do not infer", "is_error": true}),
+        json!({"schema": "nemo.relay.tool_result@2", "content": "unknown", "is_error": true, "result": null}),
+        json!({"schema": "nemo.relay.tool_result@1", "content": "malformed", "is_error": "true", "result": null}),
+    ];
+    {
+        let mut state = exporter.state.lock().unwrap();
+        for (index, output) in outputs.iter().enumerate() {
+            state.events.push(
+                event_builder(Uuid::now_v7(), EventType::End)
+                    .name(format!("tool-{index}"))
+                    .scope_type(ScopeType::Tool)
+                    .tool_call_id(format!("call-{index}"))
+                    .output(output.clone())
+                    .build(),
+            );
+        }
+        set_sequential_event_timestamps(
+            &mut state.events.iter_mut().collect::<Vec<_>>(),
+            base_timestamp(),
+            chrono::Duration::milliseconds(1),
+        );
+    }
+    let trajectory = exporter.export().unwrap();
+    let mut results: Vec<_> = trajectory
+        .steps
+        .iter()
+        .filter_map(|step| step.observation.as_ref())
+        .flat_map(|observation| &observation.results)
+        .collect();
+    results.sort_by_key(|result| {
+        result.extra.as_ref().unwrap()["event_name"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    });
+    assert_eq!(results.len(), outputs.len());
+    for (index, (result, output)) in results.iter().zip(&outputs).enumerate() {
+        assert_eq!(
+            result.content,
+            if index < 2 {
+                Some(output["content"].clone())
+            } else {
+                None
+            }
+        );
+        let extra = result.extra.as_ref().unwrap();
+        assert_eq!(
+            extra.get("is_error"),
+            if index == 1 {
+                Some(&Json::Bool(true))
+            } else {
+                None
+            }
+        );
+        assert_eq!(&extra["tool_result"], output);
+    }
+}
+
+#[test]
 fn test_exporter_preserves_annotation_when_tool_result_is_null() {
     let exporter = AtifExporter::new("session-1".to_string(), make_agent_info());
     let tool_uuid = Uuid::now_v7();
@@ -756,6 +820,74 @@ fn test_exporter_preserves_tool_content_part_array_observation_content() {
     let result = &trajectory.steps[0].observation.as_ref().unwrap().results[0];
     assert_eq!(result.content, Some(content_parts));
     assert!(result.extra.as_ref().unwrap().get("tool_result").is_none());
+}
+
+#[test]
+fn test_exporter_canonicalizes_content_parts() {
+    let parts = json!([
+        {"type": "text", "text": "first", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "second"},
+        {"type": "image", "source": {
+            "media_type": "image/png", "path": "shot.png", "detail": "high"
+        }, "provider_id": "image-1"},
+    ]);
+    let expected = json!([
+        {"type": "text", "text": "first"},
+        {"type": "text", "text": "second"},
+        {"type": "image", "source": {"media_type": "image/png", "path": "shot.png"}},
+    ]);
+    let exporter = AtifExporter::new("session-1".to_string(), make_agent_info());
+    let llm_uuid = Uuid::now_v7();
+    exporter.state.lock().unwrap().events.extend([
+        event_builder(llm_uuid, EventType::Start)
+            .scope_type(ScopeType::Llm)
+            .input(json!({"messages": [{"role": "user", "content": parts}]}))
+            .build(),
+        event_builder(llm_uuid, EventType::End)
+            .scope_type(ScopeType::Llm)
+            .output(json!({"assistant_message": {"content": parts}}))
+            .build(),
+        event_builder(Uuid::now_v7(), EventType::End)
+            .name("screenshot")
+            .scope_type(ScopeType::Tool)
+            .tool_call_id("call-1")
+            .output(parts.clone())
+            .build(),
+    ]);
+
+    let trajectory = exporter.export().unwrap();
+    assert_atif_v17_shape(&trajectory);
+    assert_eq!(trajectory.steps[0].message, expected);
+    assert_eq!(trajectory.steps[1].message, expected);
+    let observation = trajectory.steps.last().unwrap().observation.as_ref();
+    let result = &observation.unwrap().results[0];
+    assert_eq!(result.content, Some(expected));
+    assert_eq!(result.extra.as_ref().unwrap()["tool_result"], parts);
+}
+
+#[test]
+fn test_exporter_collapses_text_only_content_parts() {
+    let parts = json!([
+        {"type": "text", "text": "first", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "second"},
+    ]);
+    let exporter = AtifExporter::new("session-1".to_string(), make_agent_info());
+    let llm_uuid = Uuid::now_v7();
+    exporter.state.lock().unwrap().events.extend([
+        event_builder(llm_uuid, EventType::Start)
+            .scope_type(ScopeType::Llm)
+            .input(json!({"messages": [{"role": "user", "content": parts}]}))
+            .build(),
+        event_builder(llm_uuid, EventType::End)
+            .scope_type(ScopeType::Llm)
+            .output(json!({"assistant_message": {"content": parts}}))
+            .build(),
+    ]);
+
+    let trajectory = exporter.export().unwrap();
+    assert_atif_v17_shape(&trajectory);
+    assert_eq!(trajectory.steps[0].message, json!("first\nsecond"));
+    assert_eq!(trajectory.steps[1].message, json!("first\nsecond"));
 }
 
 #[test]
@@ -6652,9 +6784,13 @@ fn assert_provider_response_edge_shapes() {
         json!([false]),
         json!([{"type": "unknown"}]),
         json!([{"type": "text"}]),
-        json!([{"type": "image", "source": {"media_type": "text/plain"}}]),
+        json!([{"type": "image", "source": {"media_type": "text/plain", "path": "a.txt"}}]),
+        json!([
+            {"type": "text", "text": "partial"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ""}},
+        ]),
     ] {
-        assert!(!is_atif_content_parts(&invalid_parts));
+        assert!(canonicalize_atif_content_parts(&invalid_parts).is_none());
     }
     assert_eq!(
         openai_responses_output_message(&json!({"output_text": "direct"})),
@@ -6724,6 +6860,12 @@ fn assert_request_turn_state_edge_shapes() {
             {"type": "text", "text": "second"}
         ])),
         Some(json!("first\nsecond"))
+    );
+    assert_eq!(
+        openai_responses_input_content_message(&json!([{"type": "image", "source": {
+            "media_type": "image/png", "path": "shot.png", "detail": "high"
+        }}])),
+        Some(json!([{"type": "image", "source": {"media_type": "image/png", "path": "shot.png"}}]))
     );
     assert_eq!(openai_responses_input_content_message(&json!(false)), None);
 }

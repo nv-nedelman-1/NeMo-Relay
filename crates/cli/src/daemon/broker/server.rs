@@ -14,17 +14,22 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path as AxumPath, State};
-use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, RETRY_AFTER};
+#[cfg(test)]
+use axum::http::header::AUTHORIZATION;
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, RETRY_AFTER};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
+// The coverage modules below rely on this import through `use super::*`.
+#[cfg(test)]
 use base64::Engine;
 use bytes::Bytes;
 use hyper::body::Body as HttpBody;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder as ConnectionBuilder;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::Connect;
+use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::Serialize;
@@ -143,6 +148,7 @@ struct DaemonState {
     descriptor: crate::daemon::common::protocol::ComponentDescriptor,
     instance_id: String,
     pass_through: bool,
+    loopback_listener: bool,
     public_origin: String,
     config: GatewayConfig,
     upstream: PooledClient,
@@ -164,7 +170,7 @@ pub(crate) async fn serve(options: ServerOptions) -> Result<(), CliError> {
     })?;
     let local = listener.local_addr()?;
     let public_origin = daemon_origin(&options, local)?;
-    let resolved = crate::configuration::resolve_server_config(&options.gateway)?;
+    let config = crate::configuration::resolve_daemon_config(&options.gateway)?;
     let active_worker_generations = ActiveWorkerGenerations::load()?;
     let restarting_workers = active_worker_generations.snapshot()?;
     let recovery_worker_count = restarting_workers.len();
@@ -178,8 +184,9 @@ pub(crate) async fn serve(options: ServerOptions) -> Result<(), CliError> {
         descriptor: crate::daemon::common::control::descriptor(ComponentRole::Daemon),
         instance_id: uuid::Uuid::now_v7().to_string(),
         pass_through: options.pass_through,
+        loopback_listener: local.ip().is_loopback(),
         public_origin,
-        config: resolved.gateway,
+        config,
         upstream: pooled_client().map_err(|error| CliError::Launch(error.to_string()))?,
         worker_clients: WorkerClientPool::new()?,
         challenges: Mutex::new(HashMap::new()),
@@ -201,7 +208,23 @@ pub(crate) async fn serve(options: ServerOptions) -> Result<(), CliError> {
     }
     socket::recover_after_restart(Arc::clone(&state));
     spawn_maintenance(Arc::clone(&state));
-    let app = router(Arc::clone(&state));
+    let mut app = router(Arc::clone(&state));
+    if options.tls_cert.is_none() {
+        let tls = crate::gateway::tls::RelayTlsIdentity::load_or_create()
+            .and_then(|identity| identity.server_config())
+            .map_err(CliError::Launch)?;
+        let inner = app.clone();
+        let handshake_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_TLS_HANDSHAKES));
+        app = app.route(
+            "/bootstrap/tunnel",
+            get(move |request: Request<Body>| {
+                let tls = Arc::clone(&tls);
+                let inner = inner.clone();
+                let handshake_permits = Arc::clone(&handshake_permits);
+                async move { crate::gateway::tls::upgrade(request, tls, inner, handshake_permits) }
+            }),
+        );
+    }
     let address = local.to_string();
     log::info!(
         target: "nemo_relay.daemon",
@@ -224,14 +247,7 @@ pub(crate) async fn serve(options: ServerOptions) -> Result<(), CliError> {
             let tls = load_tls_config(certificate, key)?;
             serve_tls(listener, app, tls).await
         }
-        (None, None) => axum::serve(
-            listener,
-            app.layer(axum::middleware::from_fn(socket::connection_info))
-                .into_make_service_with_connect_info::<socket::SocketInfo>(),
-        )
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(CliError::Io),
+        (None, None) => serve_plain(listener, app, shutdown_signal()).await,
         _ => Err(CliError::Config(
             "--tls-cert and --tls-key must be supplied together".into(),
         )),
@@ -274,6 +290,14 @@ fn router(state: Arc<DaemonState>) -> Router {
         )
         .merge(control)
         .fallback(public_proxy)
+        .method_not_allowed_fallback(|request: Request<Body>| async move {
+            crate::operational::unmatched_route(
+                "daemon",
+                request.method(),
+                request.uri(),
+                StatusCode::METHOD_NOT_ALLOWED,
+            )
+        })
         .with_state(state)
 }
 
@@ -549,7 +573,7 @@ fn register_mcp_blocking(
     };
     let transcript = &request.proof.transcript;
     if transcript.initiator.role != ComponentRole::Mcp
-        || transcript.route_token_digest != Some(credential.digest())
+        || transcript.route_token_digest != Some(credential)
     {
         return control_message(StatusCode::UNAUTHORIZED, "route credential proof mismatch");
     }
@@ -602,7 +626,7 @@ fn register_mcp_blocking(
         &sessions,
         session_id.as_str(),
         transcript.initiator_fingerprint,
-        credential.digest(),
+        credential,
         request.worker_network.hint.clone(),
         now,
         fresh_session_token,
@@ -616,7 +640,7 @@ fn register_mcp_blocking(
     let directive = match state.registry.register_mcp(
         McpRegistration {
             fingerprint: transcript.initiator_fingerprint,
-            token_digest: credential.digest(),
+            token_digest: credential,
             session_id: session_id.clone(),
             lease_expires_at_unix_ms,
         },
@@ -647,7 +671,7 @@ fn register_mcp_blocking(
             session_id.as_str().to_owned(),
             McpControlSession {
                 fingerprint: transcript.initiator_fingerprint,
-                token_digest: credential.digest(),
+                token_digest: credential,
                 secret_digest: TokenDigest::from_token(session_token.expose().as_bytes()),
                 secret: session_token.clone(),
                 lease_expires_at_unix_ms,
@@ -1198,6 +1222,12 @@ fn stage_worker(
         Ok(secret) => secret,
         Err(error) => return control_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
+    let websocket_client = match crate::daemon::common::worker_tls::worker_websocket_client(
+        tls_root_certificate.as_deref(),
+    ) {
+        Ok(client) => client,
+        Err(error) => return control_error(StatusCode::BAD_REQUEST, error),
+    };
     let mut worker_sessions = lock(&state.worker_sessions);
     if !reserve_worker_session_slot(
         &mut worker_sessions,
@@ -1223,7 +1253,7 @@ fn stage_worker(
         data_secret.clone(),
         worker_client,
     ) {
-        Ok(target) => Arc::new(target),
+        Ok(target) => Arc::new(target.with_websocket_client(websocket_client)),
         Err(error) => return control_error(StatusCode::BAD_REQUEST, error),
     };
     worker_sessions.insert(
@@ -1592,8 +1622,14 @@ async fn public_proxy_inner(
     State(state): State<Arc<DaemonState>>,
     mut request: Request<Body>,
 ) -> Response<Body> {
-    let Some(route) = PublicRoute::from_path(request.uri().path()) else {
-        return StatusCode::NOT_FOUND.into_response();
+    let Some(route) = PublicRoute::from_request(request.uri().path(), request.headers()) else {
+        return crate::operational::unmatched_route(
+            "daemon",
+            request.method(),
+            request.uri(),
+            StatusCode::NOT_FOUND,
+        )
+        .into_response();
     };
     let credential = match public_credential(request.headers()) {
         Ok(credential) => credential,
@@ -1611,15 +1647,23 @@ async fn public_proxy_inner(
     if responses_websocket_probe(&request) {
         return StatusCode::UPGRADE_REQUIRED.into_response();
     }
-    if !public_method_allowed(request.method(), request.uri().path()) {
-        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    let websocket = crate::gateway::websocket::supported_path(request.uri().path())
+        && crate::gateway::websocket::is_websocket(&request);
+    if !websocket && !public_method_allowed(request.method(), request.uri().path()) {
+        return crate::operational::unmatched_route(
+            "daemon",
+            request.method(),
+            request.uri(),
+            StatusCode::METHOD_NOT_ALLOWED,
+        )
+        .into_response();
     }
     let (target, access) = match credential {
         None => {
             log_anonymous_pass_through(route, AnonymousReason::MissingCredential);
             (ResolvedTarget::PassThrough, ProviderAccess::Anonymous)
         }
-        Some(credential) => match state.registry.resolve_target(&credential.digest()) {
+        Some(credential) => match state.registry.resolve_target(&credential) {
             Ok(target) => {
                 if matches!(target, ResolvedTarget::PassThrough) {
                     let route_kind = match route {
@@ -1659,7 +1703,7 @@ async fn public_proxy_inner(
             Err(ResolveError::Unavailable(_)) => return unavailable_response(),
         },
     };
-    match (target, route) {
+    let mut response = match (target, route) {
         (ResolvedTarget::PassThrough, PublicRoute::Hook(hook)) => {
             let mut response = Response::new(Body::from(hook.pass_through_body()));
             response
@@ -1687,7 +1731,11 @@ async fn public_proxy_inner(
             }
             forward_to_worker(Arc::clone(&state), request, worker).await
         }
+    };
+    if matches!(route, PublicRoute::Provider(_)) {
+        crate::gateway::strip_redirect_location(&mut response);
     }
+    response
 }
 
 fn responses_websocket_probe(request: &Request<Body>) -> bool {
@@ -1704,6 +1752,9 @@ fn responses_websocket_probe(request: &Request<Body>) -> bool {
 }
 
 fn public_method_allowed(method: &Method, path: &str) -> bool {
+    if crate::gateway::websocket::live_sideband_path(path) {
+        return false; // Attach routes require a WebSocket upgrade, handled before this check.
+    }
     if matches!(path, "/models" | "/v1/models") {
         method == Method::GET
     } else {
@@ -1819,14 +1870,23 @@ async fn forward_to_provider(
 ) -> Response<Body> {
     let invocation_authenticated = access == ProviderAccess::BoundRoute;
     // Daemon-held provider credentials (configured auth headers or the daemon's own API key
-    // environment) are only lent to requests attributed to a bound route, or to every request
-    // when the operator explicitly deployed the daemon in global pass-through mode.
-    let allow_environment_provider_auth = (invocation_authenticated || state.pass_through)
-        && crate::gateway::daemon_allows_environment_provider_auth(request.headers());
+    // environment) are only lent to requests attributed to a bound route, or to requests on
+    // a loopback listener when the operator explicitly deployed global pass-through mode.
+    let allow_environment_provider_auth = (invocation_authenticated
+        || (state.pass_through && state.loopback_listener))
+        && crate::gateway::daemon_allows_provider_auth(
+            request.headers(),
+            request.uri().path(),
+            &state.config,
+        );
     let path_and_query = request
         .uri()
         .path_and_query()
         .map_or("/", |value| value.as_str());
+    let client_named = crate::gateway::daemon_destination_is_client_named(
+        request.headers(),
+        invocation_authenticated,
+    );
     let destination = match crate::gateway::daemon_provider_upstream_url_with_access(
         request.headers(),
         path_and_query,
@@ -1849,60 +1909,58 @@ async fn forward_to_provider(
     request
         .headers_mut()
         .remove(crate::agents::pi::alignment::UPSTREAM_BASE_URL_HEADER);
-    if allow_environment_provider_auth {
-        inject_provider_auth(request.headers_mut(), route, &state.config);
+    if allow_environment_provider_auth
+        && let Err(error) = inject_provider_auth(request.headers_mut(), route, &state.config).await
+    {
+        return error.into_response();
     }
-    let outcome = forward(
-        &state.upstream,
-        request,
-        &destination,
-        None,
-        None,
-        &state.config,
-    )
-    .await;
+    let helper_auth = allow_environment_provider_auth
+        && crate::upstream_auth::helper(&state.config, matches!(route, ProviderRoute::Anthropic))
+            .is_some();
+    if crate::gateway::websocket::is_websocket(&request) {
+        return crate::gateway::websocket::forward_to_provider(
+            client_named,
+            helper_auth,
+            request,
+            &destination,
+            (),
+            &state.config,
+            std::future::pending(),
+        )
+        .await
+        .unwrap_or_else(|error| control_error(StatusCode::BAD_GATEWAY, error));
+    }
+    let upstream =
+        match crate::daemon::common::transport::provider_client(&state.upstream, helper_auth) {
+            Ok(client) => client,
+            Err(error) => return CliError::Launch(error.to_string()).into_response(),
+        };
+    let outcome = if client_named {
+        match crate::daemon::common::transport::named_upstream_client() {
+            Ok(client) => forward(&client, request, &destination, None, None, &state.config).await,
+            Err(error) => return control_error(StatusCode::BAD_GATEWAY, error),
+        }
+    } else {
+        forward(&upstream, request, &destination, None, None, &state.config).await
+    };
     if let Some(failure) = outcome.failure {
         log_upstream_request_failed(route, failure);
     }
     outcome.response
 }
 
-fn inject_provider_auth(headers: &mut HeaderMap, route: ProviderRoute, config: &GatewayConfig) {
-    if crate::provider_auth::has_provider_credential(headers) {
-        return;
-    }
-    let configured = match route {
-        ProviderRoute::OpenAi => config.openai_auth_header.as_deref(),
-        ProviderRoute::Anthropic => config.anthropic_auth_header.as_deref(),
-    };
-    if let Some(configured) = configured.and_then(|value| HeaderValue::from_str(value).ok()) {
-        headers.insert(AUTHORIZATION, configured);
-        return;
-    }
-    let (name, value) = match route {
-        ProviderRoute::OpenAi => {
-            let Some(key) = nonempty_environment("OPENAI_API_KEY") else {
-                return;
-            };
-            (AUTHORIZATION, format!("Bearer {key}"))
-        }
-        ProviderRoute::Anthropic => {
-            let Some(key) = nonempty_environment("ANTHROPIC_API_KEY") else {
-                return;
-            };
-            (HeaderName::from_static("x-api-key"), key)
-        }
-    };
-    if let Ok(value) = HeaderValue::from_str(&value) {
-        headers.insert(name, value);
-    }
-}
-
-fn nonempty_environment(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
+async fn inject_provider_auth(
+    headers: &mut HeaderMap,
+    route: ProviderRoute,
+    config: &GatewayConfig,
+) -> Result<(), CliError> {
+    crate::upstream_auth::apply(
+        headers,
+        matches!(route, ProviderRoute::Anthropic),
+        true,
+        config,
+    )
+    .await
 }
 
 async fn forward_to_worker(
@@ -1911,23 +1969,40 @@ async fn forward_to_worker(
     worker: WorkerRequest,
 ) -> Response<Body> {
     let fingerprint = worker.fingerprint();
-    let worker_id = worker.target().worker_id().to_owned();
-    let path_and_query = request
-        .uri()
-        .path_and_query()
-        .map_or("/", |value| value.as_str());
-    let destination = format!(
-        "{}{}",
-        worker.target().endpoint().trim_end_matches('/'),
-        path_and_query
-    );
-    let token = worker.session_token().to_owned();
+    let worker_id = worker.target().shared_worker_id();
+    let destination = match worker.target().request_uri(request.uri()) {
+        Ok(destination) => destination,
+        Err(error) => return control_error(StatusCode::BAD_GATEWAY, error),
+    };
+    if crate::gateway::websocket::is_websocket(&request) {
+        let client = match worker.target().websocket_client() {
+            Some(client) => client.clone(),
+            None => match crate::daemon::common::transport::pooled_websocket_client() {
+                Ok(client) => client,
+                Err(error) => return control_error(StatusCode::BAD_GATEWAY, error),
+            },
+        };
+        return crate::gateway::websocket::forward(
+            &client,
+            request,
+            &destination.to_string(),
+            Some((
+                HeaderName::from_static(WORKER_TOKEN_HEADER),
+                worker.session_token().to_owned(),
+            )),
+            worker,
+            &state.config,
+            std::future::pending(),
+        )
+        .await;
+    }
     let client = worker.target().client().clone();
-    let mut outcome = forward(
+    let authentication = worker.target().authentication();
+    let mut outcome = forward_prepared(
         &client,
         request,
-        &destination,
-        Some((HeaderName::from_static(WORKER_TOKEN_HEADER), token)),
+        destination,
+        Some((HeaderName::from_static(WORKER_TOKEN_HEADER), authentication)),
         Some(worker),
         &state.config,
     )
@@ -1941,7 +2016,7 @@ async fn forward_to_worker(
             target: "nemo_relay.daemon",
             event = "worker_request_failed",
             fingerprint = fingerprint.as_str(),
-            worker_id = worker_id.as_str(),
+            worker_id = worker_id.as_ref(),
             reason = "response_head_timeout",
             route_mode = "worker";
             "Worker request timed out waiting for response headers"
@@ -2069,14 +2144,17 @@ fn log_upstream_request_failed(route: ProviderRoute, failure: ForwardFailure) {
     );
 }
 
-async fn forward(
-    client: &PooledClient,
+async fn forward<C>(
+    client: &Client<C, RelayBody>,
     request: Request<Body>,
     destination: &str,
     authentication: Option<(HeaderName, String)>,
     hold: Option<WorkerRequest>,
     config: &GatewayConfig,
-) -> ForwardOutcome {
+) -> ForwardOutcome
+where
+    C: Connect + Clone + Send + Sync + 'static,
+{
     let destination = match destination.parse::<Uri>() {
         Ok(destination) => destination,
         Err(_) => {
@@ -2086,6 +2164,32 @@ async fn forward(
             );
         }
     };
+    let authentication = match authentication {
+        Some((name, value)) => match HeaderValue::from_str(&value) {
+            Ok(value) => Some((name, value)),
+            Err(_) => {
+                return ForwardOutcome::response(control_message(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid worker credential",
+                ));
+            }
+        },
+        None => None,
+    };
+    forward_prepared(client, request, destination, authentication, hold, config).await
+}
+
+async fn forward_prepared<C>(
+    client: &Client<C, RelayBody>,
+    request: Request<Body>,
+    destination: Uri,
+    authentication: Option<(HeaderName, HeaderValue)>,
+    hold: Option<WorkerRequest>,
+    config: &GatewayConfig,
+) -> ForwardOutcome
+where
+    C: Connect + Clone + Send + Sync + 'static,
+{
     let strip = [
         HeaderName::from_static(CLIENT_TOKEN_HEADER),
         HeaderName::from_static(WORKER_TOKEN_HEADER),
@@ -2097,12 +2201,6 @@ async fn forward(
         }
     };
     if let Some((name, value)) = authentication {
-        let Ok(value) = HeaderValue::from_str(&value) else {
-            return ForwardOutcome::response(control_message(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "invalid worker credential",
-            ));
-        };
         request.headers_mut().insert(name, value);
     }
     let response = match config.wait_for_response(client.request(request)).await {
@@ -2730,7 +2828,7 @@ fn prune_expired_mcp_control_state(
 /// Returns the single public route credential, `None` when the header is absent, or a 401 for a
 /// malformed or repeated header.
 #[allow(clippy::result_large_err)]
-fn public_credential(headers: &HeaderMap) -> Result<Option<RouteCredential>, Response<Body>> {
+fn public_credential(headers: &HeaderMap) -> Result<Option<TokenDigest>, Response<Body>> {
     let values = headers.get_all(CLIENT_TOKEN_HEADER);
     match values.iter().count() {
         0 => return Ok(None),
@@ -2747,7 +2845,7 @@ fn public_credential(headers: &HeaderMap) -> Result<Option<RouteCredential>, Res
         .next()
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| control_message(StatusCode::UNAUTHORIZED, "invalid route credential"))?;
-    RouteCredential::parse(value.to_owned())
+    RouteCredential::digest_from_str(value)
         .map(Some)
         .map_err(|_| control_message(StatusCode::UNAUTHORIZED, "invalid route credential"))
 }
@@ -2900,34 +2998,67 @@ fn load_tls_config(
 }
 
 fn decode_pem_blocks(bytes: &[u8], label: &str) -> Result<Vec<Vec<u8>>, CliError> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|error| CliError::Config(format!("TLS PEM is not UTF-8: {error}")))?;
-    let begin = format!("-----BEGIN {label}-----");
-    let end = format!("-----END {label}-----");
-    let mut blocks = Vec::new();
-    let mut remainder = text;
-    while let Some((_, after_begin)) = remainder.split_once(&begin) {
-        let Some((encoded, after_end)) = after_begin.split_once(&end) else {
-            return Err(CliError::Config(format!(
-                "TLS PEM has an unterminated {label} block"
-            )));
-        };
-        let compact = encoded
-            .chars()
-            .filter(|character| !character.is_ascii_whitespace())
-            .collect::<String>();
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(compact)
-            .map_err(|_| CliError::Config(format!("TLS PEM contains invalid {label} base64")))?;
-        if decoded.is_empty() {
-            return Err(CliError::Config(format!(
-                "TLS PEM contains an empty {label} block"
-            )));
+    crate::gateway::tls::decode_pem_blocks(bytes, label).map_err(CliError::Config)
+}
+
+async fn serve_plain(
+    listener: TcpListener,
+    app: Router,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), CliError> {
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(());
+    let mut connections = tokio::task::JoinSet::new();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            _ = connections.join_next(), if !connections.is_empty() => {}
+            accepted = listener.accept() => {
+                let (stream, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        log::warn!(
+                            target: "nemo_relay.daemon", event = "listener_accept_failed";
+                            "Daemon listener accept failed: {error}"
+                        );
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                let _ = stream.set_nodelay(true);
+                let local = stream.local_addr()?;
+                let service = app.clone()
+                    .layer(axum::Extension(ConnectInfo(peer)))
+                    .layer(axum::Extension(socket::LocalAddress(local)));
+                let shutdown = shutdown_sender.clone();
+                connections.spawn(async move {
+                    let mut builder = crate::daemon::common::transport::data_plane_connection_builder();
+                    builder.http2().enable_connect_protocol();
+                    // Match axum::serve: convert Incoming before entering the router.
+                    let service = hyper::service::service_fn(move |request: Request<hyper::body::Incoming>| {
+                        let mut service = service.clone();
+                        tower_service::Service::call(&mut service, request.map(Body::new))
+                    });
+                    let connection = builder.serve_connection_with_upgrades(
+                        TokioIo::new(stream), service,
+                    );
+                    tokio::pin!(connection);
+                    tokio::select! {
+                        _ = &mut connection => {}
+                        _ = shutdown.closed() => {
+                            connection.as_mut().graceful_shutdown();
+                            let _ = connection.await;
+                        }
+                    }
+                });
+            }
         }
-        blocks.push(decoded);
-        remainder = after_end;
     }
-    Ok(blocks)
+    drop(shutdown_receiver);
+    // Preserve axum::serve's graceful shutdown: admitted responses finish before return.
+    while connections.join_next().await.is_some() {}
+    Ok(())
 }
 
 async fn serve_tls(
@@ -2974,7 +3105,7 @@ async fn serve_tls(
                         return;
                     };
                     drop(handshake_permit);
-                    let builder = ConnectionBuilder::new(TokioExecutor::new());
+                    let builder = crate::daemon::common::transport::data_plane_connection_builder();
                     let connection = builder.serve_connection_with_upgrades(
                         TokioIo::new(stream),
                         TowerToHyperService::new(service),
