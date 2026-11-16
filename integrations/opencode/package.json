@@ -1,0 +1,43 @@
+{
+  "name": "nemo-relay-opencode",
+  "version": "1.0.0",
+  "private": true,
+  "description": "NeMo Relay observability and policy for OpenCode, built on OpenCode's plugin hooks.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NVIDIA/NeMo-Relay",
+    "directory": "integrations/opencode"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/**",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:test": "node scripts/build-test.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build:test && node --test \".test-dist/test/*.test.js\""
+  },
+  "dependencies": {
+    "@opencode/schema": "2.2.5",
+    "nemo-relay-node": "1.0.0"
+  },
+  "peerDependencies": {
+    "effect": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "effect": "4.0.6",
+    "typescript": "^5.8.2"
+  }
+}

@@ -9,6 +9,7 @@
     "crates/node",
     "examples/language-binding-plugin/node",
     "integrations/openclaw",
+    "integrations/opencode",
     "integrations/pi"
   ],
   "devDependencies": {

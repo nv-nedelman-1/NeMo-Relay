@@ -31,6 +31,8 @@ crates/node/coverage/
 crates/node/junit.xml
 integrations/openclaw/dist/
 integrations/openclaw/.test-dist/
+integrations/opencode/dist/
+integrations/opencode/.test-dist/
 
 # Shared libraries
 *.dylib
