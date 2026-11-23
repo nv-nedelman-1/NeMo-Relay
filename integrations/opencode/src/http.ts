@@ -19,17 +19,29 @@ import type { Turns } from './turns.js';
 import { guarded, isRecord, message, parseJson, settle } from './util.js';
 
 /** Register the HTTP model-call hooks. */
-export function registerHttpHooks(ctx: Context, llm: LlmCalls, turns: Turns): Effect.Effect<void, never, Scope.Scope> {
+export function registerHttpHooks(
+  ctx: Context,
+  llm: LlmCalls,
+  turns: Turns,
+  failClosed: boolean,
+): Effect.Effect<void, never, Scope.Scope> {
   const calls = new WeakMap<Request, LlmCall>();
+  /** A request Relay cannot check is sent without its checks, or refused with `failClosed`. */
+  const unchecked = (event: { request: Request }, reason: string) =>
+    failClosed
+      ? Effect.andThen(
+          Effect.logError(`NeMo Relay could not check a model request, so it was refused: ${reason}`),
+          refuse(event, `Blocked because NeMo Relay could not check the request: ${reason}`),
+        )
+      : Effect.logWarning(`NeMo Relay could not check a model request, so it was sent unchecked: ${reason}`);
 
   return Effect.gen(function* () {
     yield* ctx.session.hook('http.request', (event) =>
       Effect.gen(function* () {
         const body = yield* settle(() => event.request.clone().text());
-        if ('error' in body)
-          return yield* Effect.logWarning(`NeMo Relay could not read a model request: ${message(body.error)}`);
+        if ('error' in body) return yield* unchecked(event, `its body could not be read: ${message(body.error)}`);
         let content = parseJson(body.value);
-        if (!isRecord(content)) return;
+        if (!isRecord(content)) return yield* unchecked(event, 'its body is not a JSON object');
         // A title request can come after the turn it belongs to has ended, so it joins the turn only if one
         // is open, rather than opening one nothing would close.
         const turn = yield* guarded('turn', () => {
@@ -37,7 +49,7 @@ export function registerHttpHooks(ctx: Context, llm: LlmCalls, turns: Turns): Ef
           if (event.kind === 'title') return turns.peek(event.sessionID) ?? turns.outside(event.sessionID);
           return turns.get(event.sessionID);
         });
-        if (!turn) return;
+        if (!turn) return yield* unchecked(event, 'its turn could not be opened');
         const url = new URL(event.request.url);
         const route = llm.routeOf(url.pathname);
         const metadata: Record<string, Json> = {

@@ -118,7 +118,7 @@ detector = "api_key"
 | Option | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Set `false` to turn the plugin off without removing it. |
-| `failClosed` | `false` | Set `true` to block model requests and tool calls wherever Relay is not active, for example because the Node binding or a `relayPlugins` module failed to load, instead of running without Relay. |
+| `failClosed` | `false` | Set `true` to block model requests and tool calls wherever Relay is not active, for example because the Node binding or a `relayPlugins` module failed to load, instead of running without Relay. It also blocks a call the plugin cannot check, such as a model request whose body is not a JSON object. |
 | `pluginsToml` | none | An explicit `plugins.toml` layer, applied over the user and system files Relay discovers. |
 | `plugins` | `{ "version": 1, "components": [] }` | Programmatic plugin configuration; it overrides every file layer. |
 | `relayPlugins` | `[]` | Modules to register as Relay language-binding plugins before Relay starts. |
@@ -174,8 +174,10 @@ OpenTelemetry configuration guide.
   Relay activation; a location whose options differ runs without Relay and logs why.
 - If the Node binding is unavailable or Relay fails to start, the plugin logs why and stays inactive,
   and OpenCode runs without Relay, unless `failClosed` is set. Failing to record a call is logged and
-  the call proceeds. `failClosed` guards against Relay failing, not against a user who controls their
-  OpenCode configuration removing the plugin.
+  the call proceeds. A call the plugin cannot check, because its request body is unreadable or not a
+  JSON object, or because its turn does not open, is logged and proceeds without Relay's guardrails and
+  intercepts, unless `failClosed` is set, which refuses it. `failClosed` guards against Relay failing,
+  not against a user who controls their OpenCode configuration removing the plugin.
 
 ## Development
 

@@ -263,6 +263,50 @@ enabled = true
     });
   });
 
+  it('lets a call it cannot check through by default, and refuses it with failClosed', async () => {
+    // Relay cannot open a turn for a session ID that is not valid JSON, such as NaN.
+    const turnless = NaN as unknown as string;
+    for (const failClosed of [false, true]) {
+      const test = harness('', failClosed ? { failClosed } : {});
+      await test.run(function* () {
+        const requests: (HttpRequestEvent & { response: Response | undefined })[] = [
+          { ...modelRequest('not a JSON object'), response: undefined },
+          { ...modelRequest({ messages: [] }), sessionID: turnless, response: undefined },
+        ];
+        for (const request of requests) yield* test.hook('http.request', request);
+        const tool = yield* Effect.exit(
+          test.hook('execute.before', { ...toolCall('read', { path: 'a.txt' }), sessionID: turnless }),
+        );
+        const frame = { sessionID: turnless, agent: 'build', kind: 'primary', model: { id: 'm', providerID: 'mock' } };
+        const sent = yield* Effect.exit(
+          test.hook('experimental.ws.send', { ...frame, frame: '{"type":"response.create"}' }),
+        );
+
+        if (!failClosed) {
+          assert.deepEqual(
+            requests.map((request) => request.response),
+            [undefined, undefined],
+            'the requests are sent',
+          );
+          assert.ok(
+            Exit.isSuccess(tool) && Exit.isSuccess(sent),
+            'the tool call runs and the WebSocket request is sent',
+          );
+          return;
+        }
+        for (const request of requests) {
+          assert.equal(request.response?.status, 403);
+          assert.match(
+            ((yield* Effect.promise(() => request.response!.json())) as { error: { message: string } }).error.message,
+            /^Blocked because NeMo Relay could not check the request: /,
+          );
+        }
+        assert.ok(Exit.isFailure(tool) && !Cause.hasDies(tool.cause), 'the tool call fails with a tool error');
+        assert.ok(Exit.isFailure(sent) && Cause.hasDies(sent.cause), 'the WebSocket request is not sent');
+      });
+    }
+  });
+
   it('lets a title call outlive its turn, and ends one still open at shutdown', async () => {
     const test = harness('');
     const title = (sessionID: string) => ({

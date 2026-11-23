@@ -6,8 +6,10 @@
  *
  * Every failure before the hooks are registered leaves the plugin inactive and OpenCode running, unless
  * `failClosed` asks it to refuse model requests and tool calls instead. Inside a hook, a guardrail or
- * request intercept that throws blocks its call, as in Relay's managed calls; Relay's other failures
- * are logged and the call proceeds.
+ * request intercept that throws blocks its call, as in Relay's managed calls. A call the plugin cannot
+ * check, because its request body is unreadable or not a JSON object or its turn does not open, proceeds
+ * without Relay's checks, unless `failClosed` refuses it. Relay's other failures are logged and the call
+ * proceeds.
  */
 import { Tool } from '@opencode/schema/tool';
 import { Effect, Stream, type Scope } from 'effect';
@@ -79,9 +81,9 @@ export const nemoRelay = (ctx: Context): Effect.Effect<void, never, Scope.Scope>
 
     const llm = llmCalls(relay);
     yield* Effect.addFinalizer(() => Effect.sync(() => llm.endDetached()));
-    yield* registerHttpHooks(ctx, llm, turns);
-    yield* registerWebSocketHooks(ctx, llm, turns);
-    yield* registerToolHooks(ctx, relay, turns);
+    yield* registerHttpHooks(ctx, llm, turns, failClosed);
+    yield* registerWebSocketHooks(ctx, llm, turns, failClosed);
+    yield* registerToolHooks(ctx, relay, turns, failClosed);
     yield* Effect.logInfo('NeMo Relay is active');
   });
 

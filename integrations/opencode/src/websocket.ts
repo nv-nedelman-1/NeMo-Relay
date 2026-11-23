@@ -42,7 +42,16 @@ export function registerWebSocketHooks(
   ctx: Context,
   llm: LlmCalls,
   turns: Turns,
+  failClosed: boolean,
 ): Effect.Effect<void, never, Scope.Scope> {
+  /** A request Relay cannot check is sent without its checks, or refused with `failClosed`. */
+  const unchecked = (reason: string) =>
+    failClosed
+      ? Effect.andThen(
+          Effect.logError(`NeMo Relay could not check a model request, so it was refused: ${reason}`),
+          Effect.die(new Error(`Blocked because NeMo Relay could not check the request: ${reason}`)),
+        )
+      : Effect.logWarning(`NeMo Relay could not check a model request, so it was sent unchecked: ${reason}`);
   const sockets = new Map<string, Socket>();
   const socketOf = (sessionID: string): Socket => {
     const socket = sockets.get(sessionID) ?? {};
@@ -65,7 +74,7 @@ export function registerWebSocketHooks(
         const frame = parseJson(event.frame);
         if (!isRecord(frame) || frame.type !== 'response.create') return;
         const turn = yield* guarded('turn', () => turns.get(event.sessionID));
-        if (!turn) return;
+        if (!turn) return yield* unchecked('its turn could not be opened');
         const socket = socketOf(event.sessionID);
         const { type, ...body } = frame;
         const metadata: Record<string, Json> = {

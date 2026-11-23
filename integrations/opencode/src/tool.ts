@@ -30,7 +30,18 @@ export function registerToolHooks(
   ctx: Context,
   relay: RelayRuntime,
   turns: Turns,
+  failClosed: boolean,
 ): Effect.Effect<void, never, Scope.Scope> {
+  /** A tool call Relay cannot check runs without its checks, or is refused with `failClosed`. */
+  const unchecked = (reason: string) =>
+    failClosed
+      ? Effect.andThen(
+          Effect.logError(`NeMo Relay could not check a tool call, so it was refused: ${reason}`),
+          Effect.fail(
+            new Tool.Error({ message: `Blocked because NeMo Relay could not check the tool call: ${reason}` }),
+          ),
+        )
+      : Effect.logWarning(`NeMo Relay could not check a tool call, so it ran unchecked: ${reason}`);
   /** Keyed by session and call ID, since the provider's call IDs are unique only within a conversation. */
   const calls = new Map<string, Call>();
   const keyOf = (event: { sessionID: string; id: string }) => `${event.sessionID}:${event.id}`;
@@ -59,7 +70,7 @@ export function registerToolHooks(
     yield* ctx.tool.hook('execute.before', (event) =>
       Effect.gen(function* () {
         const turn = yield* guarded('turn', () => turns.get(event.sessionID));
-        if (!turn) return;
+        if (!turn) return yield* unchecked('its turn could not be opened');
         const args = toJson(event.input);
         const metadata: Record<string, Json> = {
           source: 'opencode.execute',
