@@ -16,7 +16,8 @@ existing plugin hooks (OpenCode v2, `@opencode/plugin` 2.2 or later), so OpenCod
   trace, rooted at the agent span, separate from OpenCode's own traces. A model or tool call still
   open when the turn ends, such as a request whose connection failed, ends with it as cancelled.
   Title generation, which OpenCode does not make the turn wait for, is the exception: its call ends
-  with its own response. Requests OpenCode makes outside a turn, such as cache-warming `generate`
+  with its own response. A title request that arrives after its turn ended is an LLM call of its
+  own, with no agent scope. Requests OpenCode makes outside a turn, such as cache-warming `generate`
   requests while a session is idle, are LLM calls of their own, with no agent scope.
 - **One LLM call per provider request.** Every request OpenCode sends to a model provider, including
   title generation and compaction, with the request body and the provider's response. Over HTTP, a
@@ -155,9 +156,12 @@ OpenTelemetry configuration guide.
 ## Limits
 
 - WebSocket support uses OpenCode's `experimental.ws.*` hooks, which OpenCode may still change.
-  Request intercepts can rewrite a WebSocket frame's body but not its headers. To rebuild incremental
-  requests, the plugin keeps the last exchange of the 32 most recently used sockets; a continuation
-  on an older socket is recorded as sent.
+  Request intercepts can rewrite a WebSocket frame's body but not its headers. Guardrails check the
+  full request the plugin rebuilds, but request intercepts receive only the frame OpenCode sends,
+  which after a session's first step holds just the new input; an intercept that needs the whole
+  conversation sees it only over HTTP. To rebuild incremental requests, the plugin keeps the last
+  exchange of the 32 most recently used sockets; a continuation on an older socket is recorded as
+  sent.
 - Relay decodes OpenAI Chat Completions and Responses, Anthropic Messages, and Gemini requests and
   responses. The plugin assembles a streamed response in these formats into the response Relay
   decodes; streams from other providers, and failed streams, are recorded as the list of their events.

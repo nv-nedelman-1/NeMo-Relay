@@ -23,7 +23,12 @@ import { Turns } from './turns.js';
 import { guarded, message, settle } from './util.js';
 import { registerWebSocketHooks } from './websocket.js';
 
-const TURN_ENDS = ['session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted'] as const;
+const TURN_EVENTS = [
+  'session.execution.started',
+  'session.execution.succeeded',
+  'session.execution.failed',
+  'session.execution.interrupted',
+] as const;
 
 /** The OpenCode plugin effect: active for the lifetime of the plugin's scope. */
 export const nemoRelay = (ctx: Context): Effect.Effect<void, never, Scope.Scope> =>
@@ -54,11 +59,13 @@ export const nemoRelay = (ctx: Context): Effect.Effect<void, never, Scope.Scope>
 
     const turns = new Turns(relay, ctx.app?.version);
     yield* Effect.addFinalizer(() => guarded('shutdown', () => turns.endAll('shutdown')));
-    yield* ctx.event.subscribe({ types: TURN_ENDS }).pipe(
+    yield* ctx.event.subscribe({ types: TURN_EVENTS }).pipe(
       Stream.runForEach((event) =>
-        guarded('turn end', () =>
-          turns.end(event.data.sessionID, event.type.slice('session.execution.'.length), event.data.error),
-        ),
+        guarded('turn event', () => {
+          const outcome = event.type.slice('session.execution.'.length);
+          if (outcome === 'started') turns.get(event.data.sessionID);
+          else turns.end(event.data.sessionID, outcome, event.data.error);
+        }),
       ),
       Effect.tapError((error) =>
         Effect.logError(

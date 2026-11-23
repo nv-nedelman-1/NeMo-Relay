@@ -17,7 +17,13 @@ import type { Context } from './opencode.js';
 import type { Turn, Turns } from './turns.js';
 import { failed, guarded, isRecord, message, otelStatus, rejectionReason, sameJson, settle, toJson } from './util.js';
 
-type Call = { turn: Turn; handle: ReturnType<RelayRuntime['toolCall']>; metadata: Record<string, Json> };
+type Call = {
+  turn: Turn;
+  handle: ReturnType<RelayRuntime['toolCall']>;
+  metadata: Record<string, Json>;
+  /** Stop the turn from ending the call, once it has ended. */
+  release: () => void;
+};
 
 /** Register the tool-call hooks. */
 export function registerToolHooks(
@@ -25,12 +31,15 @@ export function registerToolHooks(
   relay: RelayRuntime,
   turns: Turns,
 ): Effect.Effect<void, never, Scope.Scope> {
+  /** Keyed by session and call ID, since the provider's call IDs are unique only within a conversation. */
   const calls = new Map<string, Call>();
+  const keyOf = (event: { sessionID: string; id: string }) => `${event.sessionID}:${event.id}`;
   /** End a call once. It can run when the turn ends, outside any hook, so it never throws. */
-  const end = (id: string, result: Json, status: string) => {
-    const call = calls.get(id);
+  const end = (key: string, result: Json, status: string) => {
+    const call = calls.get(key);
     if (!call) return;
-    calls.delete(id);
+    calls.delete(key);
+    call.release();
     const description = isRecord(result) && typeof result.error === 'string' ? result.error : undefined;
     const otel = otelStatus(
       status === 'error'
@@ -88,15 +97,16 @@ export function registerToolHooks(
           turn.run(() => relay.toolCall(event.tool, input, turn.scope, null, null, metadata, event.id)),
         );
         if (!handle) return;
-        calls.set(event.id, { turn, handle, metadata });
+        const key = keyOf(event);
         // OpenCode skips `execute.after` when the tool is interrupted or a later `execute.before` hook fails.
-        turn.onEnd(() => end(event.id, { error: 'The turn ended before the tool finished' }, 'cancelled'));
+        const release = turn.onEnd(() => end(key, { error: 'The turn ended before the tool finished' }, 'cancelled'));
+        calls.set(key, { turn, handle, metadata, release });
       }),
     );
 
     yield* ctx.tool.hook('execute.after', (event) =>
       Effect.sync(() => {
-        if (!calls.has(event.id)) return;
+        if (!calls.has(keyOf(event))) return;
         const result =
           event.status === 'completed'
             ? toJson({
@@ -104,7 +114,7 @@ export function registerToolHooks(
                 content: event.result.content.map((part) => (part.type === 'text' ? part : { type: part.type })),
               })
             : { error: event.error.message };
-        end(event.id, result, event.status);
+        end(keyOf(event), result, event.status);
       }),
     );
   });

@@ -28,6 +28,8 @@ export type LlmCall = {
   started: number;
   firstChunk?: number;
   ended?: boolean;
+  /** Stop the turn from ending the call, once it has ended. */
+  release?: () => void;
 };
 
 // OpenTelemetry GenAI semantic-convention bucket boundaries for token counts and durations.
@@ -100,6 +102,7 @@ export function llmCalls(relay: RelayRuntime) {
   function end(call: LlmCall, response: Json, outcome: StreamOutcome) {
     if (call.ended) return;
     call.ended = true;
+    call.release?.();
     detached.delete(call);
     const failure = outcome === 'error' ? failureOf(response) : undefined;
     const status = otelStatus(failure ?? (outcome === 'cancelled' ? 'neutral' : undefined));
@@ -181,7 +184,7 @@ export function llmCalls(relay: RelayRuntime) {
           const call: LlmCall = { turn, handle, metadata, model, started: performance.now() };
           if (metadata.kind === 'title' || metadata.kind === 'generate') detached.add(call);
           else
-            turn.onEnd(() =>
+            call.release = turn.onEnd(() =>
               end(call, { error: { message: 'The turn ended before the response completed' } }, 'cancelled'),
             );
           return call;

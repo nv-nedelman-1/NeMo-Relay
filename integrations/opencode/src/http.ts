@@ -30,9 +30,13 @@ export function registerHttpHooks(ctx: Context, llm: LlmCalls, turns: Turns): Ef
           return yield* Effect.logWarning(`NeMo Relay could not read a model request: ${message(body.error)}`);
         let content = parseJson(body.value);
         if (!isRecord(content)) return;
-        const turn = yield* guarded('turn', () =>
-          event.kind === 'generate' ? turns.outside(event.sessionID) : turns.get(event.sessionID),
-        );
+        // A title request can come after the turn it belongs to has ended, so it joins the turn only if one
+        // is open, rather than opening one nothing would close.
+        const turn = yield* guarded('turn', () => {
+          if (event.kind === 'generate') return turns.outside(event.sessionID);
+          if (event.kind === 'title') return turns.peek(event.sessionID) ?? turns.outside(event.sessionID);
+          return turns.get(event.sessionID);
+        });
         if (!turn) return;
         const url = new URL(event.request.url);
         const route = llm.routeOf(url.pathname);

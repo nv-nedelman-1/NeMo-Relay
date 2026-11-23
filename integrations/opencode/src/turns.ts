@@ -4,8 +4,9 @@
 /**
  * One Relay agent scope per OpenCode session turn.
  *
- * A turn opens on the first hook OpenCode runs for a session and closes when the session finishes
- * executing. Each turn is its own Relay run and its own trace, rooted at the agent span.
+ * A turn opens when the session starts executing, or on the first hook OpenCode runs for the session
+ * if that arrives before the start event, and closes when the session finishes executing. Each turn is
+ * its own Relay run and its own trace, rooted at the agent span.
  */
 import type { Json, RelayRuntime, ScopeHandle } from './modules.js';
 import { otelStatus } from './util.js';
@@ -17,13 +18,13 @@ export type Turn = {
   readonly identity: Readonly<Record<string, Json>>;
   /** Run `callback` with the turn's scope stack active. */
   run<T>(callback: () => T): T;
-  /** Run `callback` when the turn ends, before its agent scope closes. */
-  onEnd(callback: () => void): void;
+  /** Run `callback` when the turn ends, before its agent scope closes; returns a function that cancels it. */
+  onEnd(callback: () => void): () => void;
 };
 
 type OpenTurn = Turn & {
   readonly scope: ScopeHandle;
-  readonly closers: Array<() => void>;
+  readonly closers: Set<() => void>;
 };
 
 export class Turns {
@@ -34,6 +35,11 @@ export class Turns {
     private readonly relay: RelayRuntime,
     private readonly version?: string,
   ) {}
+
+  /** The open turn for `sessionID`, if there is one. */
+  peek(sessionID: string): Turn | undefined {
+    return this.#open.get(sessionID);
+  }
 
   /** The open turn for `sessionID`, opening one if needed. */
   get(sessionID: string): Turn {
@@ -48,8 +54,17 @@ export class Turns {
         ...identity,
       }),
     );
-    const closers: Array<() => void> = [];
-    const turn: OpenTurn = { scope, identity, closers, run, onEnd: (callback) => closers.push(callback) };
+    const closers = new Set<() => void>();
+    const turn: OpenTurn = {
+      scope,
+      identity,
+      closers,
+      run,
+      onEnd: (callback) => {
+        closers.add(callback);
+        return () => closers.delete(callback);
+      },
+    };
     this.#open.set(sessionID, turn);
     return turn;
   }
@@ -64,7 +79,7 @@ export class Turns {
       scope: null,
       identity: this.#identity(sessionID),
       run: <T>(callback: () => T): T => this.relay.withScopeStack(stack, callback) as T,
-      onEnd: () => undefined,
+      onEnd: () => () => undefined,
     };
   }
 
@@ -73,7 +88,7 @@ export class Turns {
     const turn = this.#open.get(sessionID);
     if (!turn) return;
     this.#open.delete(sessionID);
-    for (const close of turn.closers.splice(0)) close();
+    for (const close of [...turn.closers]) close();
     const status = otelStatus(
       outcome === 'failed'
         ? { type: error?.type ?? 'execution_failed', description: error?.message }

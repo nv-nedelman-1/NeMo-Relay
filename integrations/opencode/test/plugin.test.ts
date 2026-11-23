@@ -9,8 +9,10 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import { Cause, Effect, Exit } from 'effect';
+import * as relay from 'nemo-relay-node';
 
 import type { HttpRequestEvent, ToolBeforeEvent } from '../src/opencode.js';
+import { Turns } from '../src/turns.js';
 import { fixture, harness } from './harness.js';
 
 function modelRequest(content: unknown, url = 'http://127.0.0.1:9/v1/chat/completions'): HttpRequestEvent {
@@ -558,5 +560,68 @@ secret = "sk-live-"
         ['opencode.llm_blocked', 'the request contains a secret', 'ses_1'],
       ],
     );
+  });
+
+  it('opens a turn when the session starts executing, and leaves a late title request outside it', async () => {
+    const test = harness('');
+    const title = (sessionID: string) => ({
+      ...modelRequest({ model: 'small', messages: [{ role: 'user', content: 'Title this' }] }),
+      sessionID,
+      kind: 'title',
+    });
+    await test.run(function* () {
+      test.publish({ type: 'session.execution.started', data: { sessionID: 'ses_1' } });
+      yield* Effect.sleep('50 millis');
+      yield* test.hook('http.request', title('ses_1'));
+      test.publish({ type: 'session.execution.succeeded', data: { sessionID: 'ses_1' } });
+      yield* Effect.sleep('50 millis');
+      yield* test.hook('http.request', title('ses_1'));
+    });
+
+    const events = test.events();
+    const agents = events.filter((event) => event.category === 'agent' && event.scope_category === 'start');
+    assert.equal(agents.length, 1, 'a title request after the turn ended opens no turn of its own');
+    const [during, after] = events.filter((event) => event.category === 'llm' && event.scope_category === 'start');
+    assert.equal(during!.parent_uuid, agents[0]!.uuid, 'a title request during the turn is part of it');
+    assert.notEqual(after!.parent_uuid, agents[0]!.uuid);
+  });
+
+  it('keeps tool calls with the same ID in different sessions apart', async () => {
+    const test = harness('');
+    await test.run(function* () {
+      const call = (sessionID: string) => ({ ...toolCall('read', { path: sessionID }), sessionID, id: 'call_0' });
+      const done = (sessionID: string) => ({
+        ...call(sessionID),
+        status: 'completed' as const,
+        result: { output: `result of ${sessionID}`, content: [] },
+      });
+      yield* test.hook('execute.before', call('ses_A'));
+      yield* test.hook('execute.before', call('ses_B'));
+      yield* test.hook('execute.after', done('ses_A'));
+      yield* test.hook('execute.after', done('ses_B'));
+      test.publish({ type: 'session.execution.succeeded', data: { sessionID: 'ses_A' } });
+      test.publish({ type: 'session.execution.succeeded', data: { sessionID: 'ses_B' } });
+      yield* Effect.sleep('50 millis');
+    });
+
+    const ends = test.events().filter((event) => event.category === 'tool' && event.scope_category === 'end');
+    assert.deepEqual(
+      ends.map((event) => [event.metadata?.session_id, event.metadata?.status]),
+      [
+        ['ses_A', 'completed'],
+        ['ses_B', 'completed'],
+      ],
+    );
+    assert.match(JSON.stringify(ends[1]!.data), /result of ses_B/);
+  });
+
+  it('does not run the end callback of a call that already ended', () => {
+    const turns = new Turns(relay);
+    const turn = turns.get('ses_1');
+    let ran = 0;
+    turn.onEnd(() => ran++)();
+    turn.onEnd(() => ran++);
+    turns.end('ses_1', 'succeeded');
+    assert.equal(ran, 1);
   });
 });
