@@ -89,7 +89,9 @@ export function registerHttpHooks(ctx: Context, llm: LlmCalls, turns: Turns): Ef
             },
             (outcome) => {
               const assembled = assembleResponse(events);
-              llm.end(call, assembled.response, assembled.failed && outcome === 'success' ? 'error' : outcome);
+              // OpenCode stops reading once the response is complete, cancelling a stream the provider keeps open.
+              const ended = outcome === 'cancelled' && assembled.finished ? 'success' : outcome;
+              llm.end(call, assembled.response, assembled.failed && ended === 'success' ? 'error' : ended);
             },
           );
           return;

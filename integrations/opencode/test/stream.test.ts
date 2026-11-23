@@ -55,7 +55,7 @@ describe('tapEventStream', () => {
 
 describe('assembleResponse', () => {
   it('merges Chat Completions chunks into one chat.completion', () => {
-    const { response, failed } = assembleResponse([
+    const { response, failed, finished } = assembleResponse([
       { id: 'c1', created: 1, model: 'm', choices: [{ index: 0, delta: { role: 'assistant', content: 'Look' } }] },
       {
         choices: [
@@ -96,6 +96,8 @@ describe('assembleResponse', () => {
       usage: { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 },
     });
     assert.equal(failed, false);
+    assert.equal(finished, true);
+    assert.equal(assembleResponse([{ choices: [{ index: 0, delta: { content: 'Look' } }] }]).finished, false);
   });
 
   it('returns the terminal response of an OpenAI Responses stream, and whether it failed', () => {
@@ -107,19 +109,22 @@ describe('assembleResponse', () => {
     assert.deepEqual(assembleResponse([delta, { type: 'response.completed', response: completed }]), {
       response: completed,
       failed: false,
+      finished: true,
     });
     assert.deepEqual(assembleResponse([delta, { type: 'response.incomplete', response: incomplete }]), {
       response: incomplete,
       failed: false,
+      finished: true,
     });
     assert.deepEqual(assembleResponse([delta, { type: 'response.failed', response: failed }]), {
       response: failed,
       failed: true,
+      finished: true,
     });
   });
 
   it('assembles an Anthropic Messages stream into the message it builds', () => {
-    const { response, failed } = assembleResponse([
+    const { response, failed, finished } = assembleResponse([
       {
         type: 'message_start',
         message: {
@@ -167,10 +172,11 @@ describe('assembleResponse', () => {
       usage: { input_tokens: 12, output_tokens: 30 },
     });
     assert.equal(failed, false);
+    assert.equal(finished, true);
   });
 
   it('merges Gemini stream chunks into one response', () => {
-    const { response } = assembleResponse([
+    const { response, finished } = assembleResponse([
       {
         candidates: [{ index: 0, content: { role: 'model', parts: [{ text: 'Reading ' }] } }],
         modelVersion: 'gemini-2.5-pro',
@@ -205,6 +211,7 @@ describe('assembleResponse', () => {
       usageMetadata: { promptTokenCount: 9, candidatesTokenCount: 4, totalTokenCount: 13 },
       modelVersion: 'gemini-2.5-pro',
     });
+    assert.equal(finished, true);
   });
 
   it('returns the events of other providers, and of a failed stream, as sent', () => {
@@ -218,7 +225,7 @@ describe('assembleResponse', () => {
       { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } },
     ];
 
-    assert.deepEqual(assembleResponse(cohere), { response: cohere, failed: false });
-    assert.deepEqual(assembleResponse(anthropic), { response: anthropic, failed: true });
+    assert.deepEqual(assembleResponse(cohere), { response: cohere, failed: false, finished: false });
+    assert.deepEqual(assembleResponse(anthropic), { response: anthropic, failed: true, finished: false });
   });
 });

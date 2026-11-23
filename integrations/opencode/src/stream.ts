@@ -81,24 +81,25 @@ type ChatChunk = { id?: string; created?: number; model?: string; choices?: Chat
 const RESPONSES_TERMINAL = new Set(['response.completed', 'response.incomplete', 'response.failed']);
 
 /**
- * The provider response a stream's events add up to, and whether the stream reported a failure: the
- * response a non-streamed call would have returned, which Relay decodes, for OpenAI Chat Completions
- * and Responses, Anthropic Messages, and Gemini streams; otherwise, and for a failed stream, the events
- * as sent.
+ * The provider response a stream's events add up to, whether the stream reported a failure, and whether
+ * it finished the response: the response a non-streamed call would have returned, which Relay decodes,
+ * for OpenAI Chat Completions and Responses, Anthropic Messages, and Gemini streams; otherwise, and for a
+ * failed stream, the events as sent.
  */
-export function assembleResponse(events: readonly Json[]): { response: Json; failed: boolean } {
+export function assembleResponse(events: readonly Json[]): { response: Json; failed: boolean; finished: boolean } {
   const failed = events.some(
     (event) => isRecord(event) && (event.type === 'response.failed' || event.type === 'error'),
   );
+  const finished = events.some(finishes);
   for (const event of events)
     if (isRecord(event) && RESPONSES_TERMINAL.has(String(event.type)) && isRecord(event.response))
-      return { response: event.response, failed };
+      return { response: event.response, failed, finished };
   const has = (test: (event: Record<string, Json>) => boolean) =>
     events.some((event) => isRecord(event) && test(event));
-  if (failed) return { response: [...events], failed };
-  if (has((event) => event.type === 'message_start')) return { response: anthropicMessage(events), failed };
-  if (has((event) => Array.isArray(event.candidates))) return { response: geminiResponse(events), failed };
-  if (!has((event) => Array.isArray(event.choices))) return { response: [...events], failed };
+  if (failed) return { response: [...events], failed, finished };
+  if (has((event) => event.type === 'message_start')) return { response: anthropicMessage(events), failed, finished };
+  if (has((event) => Array.isArray(event.candidates))) return { response: geminiResponse(events), failed, finished };
+  if (!has((event) => Array.isArray(event.choices))) return { response: [...events], failed, finished };
   const choices = new Map<
     number,
     { role: string; content: string; tools: Map<number, Required<ChatToolCall>>; finish: string | null }
@@ -149,7 +150,19 @@ export function assembleResponse(events: readonly Json[]): { response: Json; fai
     })),
     ...(usage === undefined ? {} : { usage }),
   };
-  return { response: response as Json, failed };
+  return { response: response as Json, failed, finished };
+}
+
+/**
+ * Whether `event` ends its stream's response: a terminal Responses event, Anthropic's `message_stop`, or a
+ * Chat Completions choice or Gemini candidate with its finish reason.
+ */
+function finishes(event: Json): boolean {
+  if (!isRecord(event)) return false;
+  if (RESPONSES_TERMINAL.has(String(event.type)) || event.type === 'message_stop') return true;
+  const reason = (items: Json | undefined, key: string) =>
+    Array.isArray(items) && items.some((item) => isRecord(item) && typeof item[key] === 'string');
+  return reason(event.choices, 'finish_reason') || reason(event.candidates, 'finishReason');
 }
 
 /** An Anthropic Messages stream as the `message` it builds, block by block. */

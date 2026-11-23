@@ -445,6 +445,47 @@ enabled = true
     assert.deepEqual(tokens, [[3, 2], [4, 1], []]);
   });
 
+  it('records a stream OpenCode stops reading after its final event as a success', async () => {
+    const test = harness('');
+    const partial = { choices: [{ index: 0, delta: { role: 'assistant', content: 'Hel' } }] };
+    const final = {
+      choices: [{ index: 0, delta: { content: 'lo' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 3, completion_tokens: 2 },
+    };
+    await test.run(function* () {
+      for (const events of [[partial, final], [partial]]) {
+        const request = modelRequest({ model: 'm', stream: true, messages: [] });
+        yield* test.hook('http.request', request);
+        // The provider keeps the stream open after its last event; OpenCode reads what arrived, then cancels.
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            for (const event of events)
+              controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+          },
+        });
+        const answered = {
+          ...request,
+          response: new Response(body, { headers: { 'content-type': 'text/event-stream' } }),
+        };
+        yield* test.hook('http.response', answered);
+        yield* Effect.promise(async () => {
+          const reader = answered.response.body!.getReader();
+          for (const _ of events) await reader.read();
+          await reader.cancel();
+        });
+      }
+      test.publish({ type: 'session.execution.succeeded', data: { sessionID: 'ses_1' } });
+      yield* Effect.sleep('50 millis');
+    });
+
+    const ends = test.events().filter((event) => event.category === 'llm' && event.scope_category === 'end');
+    assert.deepEqual(
+      ends.map((event) => event.metadata?.outcome),
+      ['success', 'cancelled'],
+      'a stream cut off before its final event is still cancelled',
+    );
+  });
+
   it('passes a binary stream to OpenCode without waiting for it to end', { timeout: 10_000 }, async () => {
     const test = harness('');
     await test.run(function* () {
